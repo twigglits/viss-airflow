@@ -1,0 +1,8 @@
+# Airflow local state
+logs/
+.airflow*
+__pycache__/
+.env
+# IDE
+.vscode/
+.idea/
