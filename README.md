@@ -106,6 +106,13 @@ docker compose logs -f airflow-scheduler
 - If port 8081 is busy, edit `docker-compose.yaml` and change the mapping under `airflow-webserver` from `"8081:8080"` to another free port (e.g., `"8090:8080"`).
 - If you change your UID, regenerate `.env` and recreate containers.
 
+## Pre-reqs for Geotiff ETL Pipeline
+
+It is required to install the following apt packages inside of the airflow scheduler container for the processing of geotiff files to work in the DAG.
+```bash
+docker compose exec -u root airflow-scheduler bash -lc "apt-get update && apt-get install -y gdal-bin && gdalwarp --version && gdalinfo --version"
+```
+
 ## Geotiff ETL Pipeline
 
 Currently it's a two step process. First step is to convert the downloaded .tif file to Web Mercator. (Not sure yet what the compression argument does yet, whether lossy or lossless)
