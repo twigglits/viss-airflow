@@ -105,3 +105,56 @@ docker compose logs -f airflow-scheduler
 - Ensure ports `8081` (web) and `5432` (Postgres) are free on your host.
 - If port 8081 is busy, edit `docker-compose.yaml` and change the mapping under `airflow-webserver` from `"8081:8080"` to another free port (e.g., `"8090:8080"`).
 - If you change your UID, regenerate `.env` and recreate containers.
+
+## Geotiff ETL Pipeline
+
+Currently it's a two step process. First step is to convert the downloaded .tif file to Web Mercator. (Not sure yet what the compression argument does yet, whether lossy or lossless)
+
+```bash
+gdalwarp -t_srs EPSG:3857 -r bilinear -multi \
+  -srcnodata -99999 -dstnodata -99999 \
+  -co COMPRESS=LZW \
+  /home/jeannaude/epi/viss-frontend/frontend/zaf_pop_2025_CN_100m_R2025A_v1.tif \
+  /home/jeannaude/epi/viss-frontend/frontend/zaf_pop_2025_CN_100m_R2025A_v1_3857.tif
+```
+
+Second step is to convert the .tif file to a COG. (Not sure yet what the compression argument does yet, whether lossy or lossless.)
+```bash
+gdal_translate -of COG \
+  -co COMPRESS=ZSTD \
+  -co NUM_THREADS=ALL_CPUS \
+  -co OVERVIEW_RESAMPLING=AVERAGE \
+  /home/jeannaude/epi/viss-frontend/frontend/zaf_pop_2025_CN_100m_R2025A_v1_3857.tif \
+  /home/jeannaude/epi/viss-frontend/frontend/zaf_pop_2025_CN_100m_R2025A_v1_cog.tif
+  ```
+
+We can then vailidate if it's a healthy COG with:
+```bash
+gdalinfo /home/jeannaude/epi/viss-frontend/frontend/zaf_pop_2025_CN_100m_R2025A_v1_cog.tif | \
+  grep -i -E 'coordinate|tiling|overviews|compression|NoData'
+```
+
+(Optional)
+
+```bash
+docker run --rm -v /home/jeannaude/epi/viss-frontend/frontend:/data osgeo/gdal:alpine-small-latest \
+  gdalwarp -t_srs EPSG:3857 -r bilinear -multi \
+  -srcnodata -99999 -dstnodata -99999 \
+  -co COMPRESS=LZW \
+  /data/zaf_pop_2025_CN_100m_R2025A_v1.tif \
+  /data/zaf_pop_2025_CN_100m_R2025A_v1_3857.tif
+  
+
+docker run --rm -v /home/jeannaude/epi/viss-frontend/frontend:/data osgeo/gdal:alpine-small-latest \
+  gdal_translate -of COG \
+  -co COMPRESS=ZSTD \
+  -co NUM_THREADS=ALL_CPUS \
+  -co OVERVIEW_RESAMPLING=AVERAGE \
+  /data/zaf_pop_2025_CN_100m_R2025A_v1_3857.tif \
+  /data/zaf_pop_2025_CN_100m_R2025A_v1_cog.tif
+  
+
+docker run --rm -v /home/jeannaude/epi/viss-frontend/frontend:/data osgeo/gdal:alpine-small-latest \
+  gdalinfo /data/zaf_pop_2025_CN_100m_R2025A_v1_cog.tif | \
+  grep -i -E 'coordinate|tiling|overviews|compression|NoData'
+```
