@@ -6,11 +6,14 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ""
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # Connection used by DAGs to store raster objects in Postgres within this stack
+    AIRFLOW_CONN_VISS_DATA_DB: postgresql+psycopg2://airflow:airflow@postgres:5432/viss
     _PIP_ADDITIONAL_REQUIREMENTS: "-r /opt/airflow/requirements.txt"
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
+    - ./data:/opt/airflow/data
     - ./requirements.txt:/opt/airflow/requirements.txt
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
@@ -34,6 +37,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
 
   airflow-init:
     <<: *airflow-common

@@ -1,19 +1,29 @@
 from datetime import datetime
 from pathlib import Path
 import os
+import hashlib
+import mimetypes
 import requests
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.bash import BashOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 # Inputs (adjust as needed)
 RAW_URL = "https://data.worldpop.org/GIS/Population/Global_2015_2030/R2025A/2025/ZAF/v1/100m/constrained/zaf_pop_2025_CN_100m_R2025A_v1.tif"
 
-# Local targets (matching your current project layout)
-RAW_PATH = "/home/jeannaude/epi/viss-frontend/frontend/zaf_pop_2025_CN_100m_R2025A_v1.tif"
-WM_PATH  = "/home/jeannaude/epi/viss-frontend/frontend/zaf_pop_2025_CN_100m_R2025A_v1_3857.tif"
-COG_PATH = "/home/jeannaude/epi/viss-frontend/frontend/zaf_pop_2025_CN_100m_R2025A_v1_cog.tif"
+# Storage paths inside containers (use a mounted volume in compose for persistence)
+# Prefer mounting ./data -> /opt/airflow/data in docker-compose; /tmp works but is ephemeral
+DATA_DIR = Path(os.environ.get("AIRFLOW_DATA_DIR", "/opt/airflow/data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+RAW_PATH = str(DATA_DIR / "zaf_pop_2025_CN_100m_R2025A_v1.tif")
+WM_PATH  = str(DATA_DIR / "zaf_pop_2025_CN_100m_R2025A_v1_3857.tif")
+COG_PATH = str(DATA_DIR / "zaf_pop_2025_CN_100m_R2025A_v1_cog.tif")
+
+# Target Postgres connection (configure in Airflow Admin -> Connections)
+PG_CONN_ID = "viss_data_db"
 
 
 def _download_raw(**context):
@@ -52,6 +62,88 @@ def _ensure_requests():
         raise RuntimeError("Python package `requests` is required in the worker env") from e
 
 
+def _ensure_env():
+    """Top-level callable for PythonOperator: validate tools and Python deps."""
+    _ensure_tools()
+    _ensure_requests()
+
+
+def _ensure_db_objects_exist():
+    """Create the table to track raster objects if it doesn't already exist."""
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    sql = """
+    CREATE TABLE IF NOT EXISTS raster_objects (
+        id SERIAL PRIMARY KEY,
+        stage TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        sha256 TEXT,
+        size_bytes BIGINT,
+        content_type TEXT,
+        lo_oid OID NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql)
+        conn.commit()
+
+
+def _store_file_as_large_object(stage: str, file_path: str, run_id: str):
+    """Store a local file into Postgres as a Large Object and record metadata.
+
+    Uses psycopg2 large object API via PostgresHook connection.
+    """
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    file_path = Path(file_path)
+    filename = file_path.name
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+    hasher = hashlib.sha256()
+    size = 0
+
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        # Create the large object and stream-write to avoid loading whole file in memory
+        lo = conn.lobject(0, 'w')
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                lo.write(chunk)
+                hasher.update(chunk)
+                size += len(chunk)
+        oid = lo.oid
+        lo.close()
+
+        cur.execute(
+            """
+            INSERT INTO raster_objects (stage, filename, run_id, sha256, size_bytes, content_type, lo_oid)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (stage, filename, run_id, hasher.hexdigest(), size, content_type, oid),
+        )
+        conn.commit()
+
+
+def _store_raw(**context):
+    ti = context.get("ti")
+    run_id = ti.run_id if ti else "unknown"
+    _ensure_db_objects_exist()
+    _store_file_as_large_object("raw", RAW_PATH, run_id)
+
+
+def _store_wm(**context):
+    ti = context.get("ti")
+    run_id = ti.run_id if ti else "unknown"
+    _ensure_db_objects_exist()
+    _store_file_as_large_object("warped_web_mercator", WM_PATH, run_id)
+
+
+def _store_cog(**context):
+    ti = context.get("ti")
+    run_id = ti.run_id if ti else "unknown"
+    _ensure_db_objects_exist()
+    _store_file_as_large_object("cog", COG_PATH, run_id)
+
+
 default_args = {
     "owner": "airflow",
     "retries": 1,
@@ -69,13 +161,17 @@ with DAG(
 
     ensure_env = PythonOperator(
         task_id="ensure_env",
-        python_callable=lambda: (_ensure_tools(), _ensure_requests()),
+        python_callable=_ensure_env,
     )
 
     download_raw = PythonOperator(
         task_id="download_raw",
         python_callable=_download_raw,
-        provide_context=True,
+    )
+
+    store_raw = PythonOperator(
+        task_id="store_raw",
+        python_callable=_store_raw,
     )
 
     warp_web_mercator = BashOperator(
@@ -107,3 +203,16 @@ with DAG(
             r"grep -i -E Coordinate"
         ),
     )
+
+    store_wm = PythonOperator(
+        task_id="store_wm",
+        python_callable=_store_wm,
+    )
+
+    store_cog = PythonOperator(
+        task_id="store_cog",
+        python_callable=_store_cog,
+    )
+
+    # Chaining: ensure proper order and persist each artifact to Postgres
+    ensure_env >> download_raw >> store_raw >> warp_web_mercator >> store_wm >> to_cog >> store_cog >> validate_cog

@@ -106,11 +106,26 @@ docker compose logs -f airflow-scheduler
 - If port 8081 is busy, edit `docker-compose.yaml` and change the mapping under `airflow-webserver` from `"8081:8080"` to another free port (e.g., `"8090:8080"`).
 - If you change your UID, regenerate `.env` and recreate containers.
 
-## Pre-reqs for Geotiff ETL Pipeline
+## Pre-reqs for first time startup
+
+Create the postgres database `viss` if it does not already exist
+```bash
+docker compose exec postgres sh -lc "psql -U airflow -d postgres -c \"CREATE DATABASE viss OWNER airflow;\""
+```
+
+## Pre-reqs for Geotiff ETL Pipeline(before each and every run)
 
 It is required to install the following apt packages inside of the airflow scheduler container for the processing of geotiff files to work in the DAG.
 ```bash
 docker compose exec -u root airflow-scheduler bash -lc "apt-get update && apt-get install -y gdal-bin && gdalwarp --version && gdalinfo --version"
+```
+
+```bash
+docker compose exec -u root airflow-scheduler bash -lc   "pip show apache-airflow-providers-postgres || pip install --no-cache-dir apache-airflow-providers-postgres"
+```
+
+```bash
+docker compose exec -u root airflow-webserver  bash -lc   "pip show apache-airflow-providers-postgres || pip install --no-cache-dir apache-airflow-providers-postgres"
 ```
 
 ## Geotiff ETL Pipeline
