@@ -177,7 +177,7 @@ with DAG(
     warp_web_mercator = BashOperator(
         task_id="warp_web_mercator",
         bash_command=(
-            "gdalwarp -t_srs EPSG:3857 -r bilinear -multi "
+            "gdalwarp -overwrite -t_srs EPSG:3857 -r bilinear -multi "
             "-srcnodata -99999 -dstnodata -99999 "
             "-co COMPRESS=LZW "
             f"{RAW_PATH} {WM_PATH}"
@@ -187,6 +187,8 @@ with DAG(
     to_cog = BashOperator(
         task_id="to_cog",
         bash_command=(
+            "set -euo pipefail; "
+            f"rm -f {COG_PATH}; "
             "gdal_translate -of COG "
             "-co COMPRESS=ZSTD "
             "-co NUM_THREADS=ALL_CPUS "
