@@ -5,11 +5,12 @@ USER root
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     gdal-bin \
+    curl \
  && rm -rf /var/lib/apt/lists/*
 
 # Install Airflow providers needed by the DAGs
 USER airflow
-RUN pip install --no-cache-dir \
-    apache-airflow-providers-postgres
+COPY requirements.txt /opt/airflow/requirements.txt
+RUN pip install --no-cache-dir -r /opt/airflow/requirements.txt
 
 # Keep defaults from base image

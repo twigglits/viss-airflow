@@ -1,3 +1,2 @@
-# Add any Airflow provider or Python dependency here.
-# Example:
-# apache-airflow-providers-postgres>=5.10.0
+apache-airflow-providers-postgres>=5.10.0
+pandas>=2.0

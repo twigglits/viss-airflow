@@ -43,7 +43,7 @@ services:
     <<: *airflow-common
     build:
       context: .
-      dockerfile: docker/airflow-gdal.Dockerfile
+      dockerfile: Dockerfile
     entrypoint: /bin/bash
     # Run init as root to avoid getpwuid uid-not-found when using arbitrary host UID
     user: "0:0"
@@ -63,7 +63,7 @@ services:
     <<: *airflow-common
     build:
       context: .
-      dockerfile: docker/airflow-gdal.Dockerfile
+      dockerfile: Dockerfile
     command: webserver
     environment:
       <<: *airflow-env
@@ -81,7 +81,7 @@ services:
     <<: *airflow-common
     build:
       context: .
-      dockerfile: docker/airflow-gdal.Dockerfile
+      dockerfile: Dockerfile
     command: scheduler
     environment:
       <<: *airflow-env
@@ -97,7 +97,7 @@ services:
     <<: *airflow-common
     build:
       context: .
-      dockerfile: docker/airflow-gdal.Dockerfile
+      dockerfile: Dockerfile
     command: triggerer
     environment:
       <<: *airflow-env
