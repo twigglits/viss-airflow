@@ -10,7 +10,7 @@ RUN apt-get update \
 
 # Install Airflow providers needed by the DAGs
 USER airflow
-COPY requirements.txt /opt/airflow/requirements.txt
+COPY viss-airflow/requirements.txt /opt/airflow/requirements.txt
 RUN pip install --no-cache-dir -r /opt/airflow/requirements.txt
 
 # Keep defaults from base image
