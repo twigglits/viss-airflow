@@ -2,7 +2,8 @@ FROM apache/airflow:2.9.3
 
 # Install system deps (GDAL CLI tools)
 USER root
-RUN apt-get update \
+RUN rm -f /etc/apt/sources.list.d/mariadb*.list \
+ && apt-get update \
  && apt-get install -y --no-install-recommends \
     gdal-bin \
     curl \
