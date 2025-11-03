@@ -6,7 +6,7 @@ import mimetypes
 import requests
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, get_current_context, ShortCircuitOperator
 from airflow.operators.bash import BashOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
@@ -24,14 +24,14 @@ COG_PATH = str(DATA_DIR / "zaf_pop_2025_CN_100m_R2025A_v1_cog.tif")
 
 # Target Postgres connection (configure in Airflow Admin -> Connections)
 PG_CONN_ID = "viss_data_db"
+YEARS = [y for y in range(2015, 2026)]
 
 
-def _download_raw(**context):
-    url = RAW_URL
-    dest = Path(RAW_PATH)
+def _download_file(url: str, dest_path: str):
+    ctx = get_current_context()
+    dest = Path(dest_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # If exists, skip; set force=True via DAG run conf to re-download
-    force = context.get("dag_run").conf.get("force", False) if context.get("dag_run") else False
+    force = ctx.get("dag_run").conf.get("force", False) if ctx.get("dag_run") else False
     if dest.exists() and not force:
         print(f"Exists, skipping: {dest}")
         return str(dest)
@@ -89,6 +89,22 @@ def _ensure_db_objects_exist():
         conn.commit()
 
 
+def _cog_exists_in_db(filename: str) -> bool:
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM raster_objects
+            WHERE stage = 'cog' AND filename = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (filename,),
+        )
+        return cur.fetchone() is not None
+
+
 def _store_file_as_large_object(stage: str, file_path: str, run_id: str):
     """Store a local file into Postgres as a Large Object and record metadata.
 
@@ -123,25 +139,23 @@ def _store_file_as_large_object(stage: str, file_path: str, run_id: str):
         conn.commit()
 
 
-def _store_raw(**context):
-    ti = context.get("ti")
+def _store_lo(stage: str, file_path: str):
+    ctx = get_current_context()
+    ti = ctx.get("ti")
     run_id = ti.run_id if ti else "unknown"
     _ensure_db_objects_exist()
-    _store_file_as_large_object("raw", RAW_PATH, run_id)
+    _store_file_as_large_object(stage, file_path, run_id)
 
 
-def _store_wm(**context):
-    ti = context.get("ti")
-    run_id = ti.run_id if ti else "unknown"
-    _ensure_db_objects_exist()
-    _store_file_as_large_object("warped_web_mercator", WM_PATH, run_id)
+def _year_paths(year: int):
+    raw = str(DATA_DIR / f"zaf_pop_{year}_CN_100m_R2025A_v1.tif")
+    wm = str(DATA_DIR / f"zaf_pop_{year}_CN_100m_R2025A_v1_3857.tif")
+    cog = str(DATA_DIR / f"zaf_pop_{year}_CN_100m_R2025A_v1_cog.tif")
+    return raw, wm, cog
 
 
-def _store_cog(**context):
-    ti = context.get("ti")
-    run_id = ti.run_id if ti else "unknown"
-    _ensure_db_objects_exist()
-    _store_file_as_large_object("cog", COG_PATH, run_id)
+def _year_url(year: int) -> str:
+    return f"https://data.worldpop.org/GIS/Population/Global_2015_2030/R2025A/{year}/ZAF/v1/100m/constrained/zaf_pop_{year}_CN_100m_R2025A_v1.tif"
 
 
 default_args = {
@@ -164,57 +178,77 @@ with DAG(
         python_callable=_ensure_env,
     )
 
-    download_raw = PythonOperator(
-        task_id="download_raw",
-        python_callable=_download_raw,
-    )
+    for year in YEARS:
+        raw_path, wm_path, cog_path = _year_paths(year)
+        url = _year_url(year)
 
-    store_raw = PythonOperator(
-        task_id="store_raw",
-        python_callable=_store_raw,
-    )
+        def _check_missing(year: int, expected_cog: str) -> bool:
+            _ensure_db_objects_exist()
+            exists = _cog_exists_in_db(Path(expected_cog).name)
+            if exists:
+                print(f"COG already in DB for {year}: {expected_cog} -> skipping year")
+                return False
+            return True
 
-    warp_web_mercator = BashOperator(
-        task_id="warp_web_mercator",
-        bash_command=(
-            "gdalwarp -overwrite -t_srs EPSG:3857 -r bilinear -multi "
-            "-srcnodata -99999 -dstnodata -99999 "
-            "-co COMPRESS=LZW "
-            f"{RAW_PATH} {WM_PATH}"
-        ),
-    )
+        check_missing = ShortCircuitOperator(
+            task_id=f"check_missing_{year}",
+            python_callable=lambda y=year, c=cog_path: _check_missing(y, c),
+        )
 
-    to_cog = BashOperator(
-        task_id="to_cog",
-        bash_command=(
-            "set -euo pipefail; "
-            f"rm -f {COG_PATH}; "
-            "gdal_translate -of COG "
-            "-co COMPRESS=ZSTD "
-            "-co NUM_THREADS=ALL_CPUS "
-            "-co OVERVIEW_RESAMPLING=AVERAGE "
-            f"{WM_PATH} {COG_PATH}"
-        ),
-    )
+        download_raw = PythonOperator(
+            task_id=f"download_raw_{year}",
+            python_callable=_download_file,
+            op_kwargs={"url": url, "dest_path": raw_path},
+        )
 
-    validate_cog = BashOperator(
-        task_id="validate_cog",
-        bash_command=(
-            "set -euo pipefail; "
-            f"gdalinfo {COG_PATH} | "
-            r"grep -i -E Coordinate"
-        ),
-    )
+        store_raw = PythonOperator(
+            task_id=f"store_raw_{year}",
+            python_callable=_store_lo,
+            op_kwargs={"stage": "raw", "file_path": raw_path},
+        )
 
-    store_wm = PythonOperator(
-        task_id="store_wm",
-        python_callable=_store_wm,
-    )
+        warp_web_mercator = BashOperator(
+            task_id=f"warp_web_mercator_{year}",
+            bash_command=(
+                "gdalwarp -overwrite -t_srs EPSG:3857 -r bilinear -multi "
+                "-srcnodata -99999 -dstnodata -99999 "
+                "-co COMPRESS=LZW "
+                "{raw} {wm}"
+            ).format(raw=raw_path, wm=wm_path),
+        )
 
-    store_cog = PythonOperator(
-        task_id="store_cog",
-        python_callable=_store_cog,
-    )
+        store_wm = PythonOperator(
+            task_id=f"store_wm_{year}",
+            python_callable=_store_lo,
+            op_kwargs={"stage": "warped_web_mercator", "file_path": wm_path},
+        )
 
-    # Chaining: ensure proper order and persist each artifact to Postgres
-    ensure_env >> download_raw >> store_raw >> warp_web_mercator >> store_wm >> to_cog >> store_cog >> validate_cog
+        to_cog = BashOperator(
+            task_id=f"to_cog_{year}",
+            bash_command=(
+                "set -euo pipefail; "
+                "rm -f {cog}; "
+                "gdal_translate -of COG "
+                "-co COMPRESS=ZSTD "
+                "-co NUM_THREADS=ALL_CPUS "
+                "-co OVERVIEW_RESAMPLING=AVERAGE "
+                "{wm} {cog}"
+            ).format(wm=wm_path, cog=cog_path),
+        )
+
+        store_cog = PythonOperator(
+            task_id=f"store_cog_{year}",
+            python_callable=_store_lo,
+            op_kwargs={"stage": "cog", "file_path": cog_path},
+        )
+
+        validate_cog = BashOperator(
+            task_id=f"validate_cog_{year}",
+            bash_command=(
+                "set -euo pipefail; "
+                "gdalinfo {cog} | "
+                r"grep -i -E Coordinate"
+            ).format(cog=cog_path),
+        )
+
+        ensure_env >> check_missing >> download_raw >> store_raw >> warp_web_mercator >> store_wm >> to_cog >> store_cog >> validate_cog
