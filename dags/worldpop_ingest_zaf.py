@@ -164,7 +164,7 @@ default_args = {
 }
 
 with DAG(
-    dag_id="worldpop_ingest_cog",
+    dag_id="worldpop_ingest_zaf",
     description="Download WorldPop raw TIFF -> warp to EPSG:3857 -> COG -> validate",
     start_date=datetime(2025, 1, 1),
     schedule=None,
