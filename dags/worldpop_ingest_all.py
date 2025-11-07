@@ -139,17 +139,17 @@ def _download_file(url: str, dest_path: str):
     dest = Path(dest_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     force = ctx.get("dag_run").conf.get("force", False) if ctx.get("dag_run") else False
-    # HEAD check: skip download if remote doesn't exist
+    if dest.exists() and not force:
+        print(f"Exists, skipping download: {dest}")
+        return str(dest)
+
+    # HEAD check only if we need to download
     try:
         h = requests.head(url, timeout=30, allow_redirects=True)
         if h.status_code >= 400:
             raise RuntimeError(f"Remote not available (HEAD {h.status_code}): {url}")
     except Exception as e:
         raise RuntimeError(f"HEAD failed for {url}: {e}")
-
-    if dest.exists() and not force:
-        print(f"Exists, skipping download: {dest}")
-        return str(dest)
 
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
@@ -237,6 +237,8 @@ for CC3 in ISO3_CODES:
         start_date=datetime(2025, 1, 1),
         schedule=None,
         catchup=False,
+        concurrency=1,
+        max_active_runs=1,
         default_args={"owner": "airflow", "retries": 1},
         tags=["worldpop", "raster", "cog", cc3u],
     ) as dag:
