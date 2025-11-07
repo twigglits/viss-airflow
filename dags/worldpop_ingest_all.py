@@ -290,7 +290,7 @@ for CC3 in ISO3_CODES:
                 bash_command=(
                     "gdalwarp -overwrite -t_srs EPSG:3857 -r bilinear -multi "
                     "-srcnodata -99999 -dstnodata -99999 "
-                    "-co COMPRESS=LZW "
+                    "-co BIGTIFF=YES -co COMPRESS=LZW "
                     "{raw} {wm}"
                 ).format(raw=raw_path, wm=wm_path),
             )
