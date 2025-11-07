@@ -140,16 +140,29 @@ def _download_file(url: str, dest_path: str):
     dest.parent.mkdir(parents=True, exist_ok=True)
     force = ctx.get("dag_run").conf.get("force", False) if ctx.get("dag_run") else False
     if dest.exists() and not force:
-        print(f"Exists, skipping download: {dest}")
-        return str(dest)
-
-    # HEAD check only if we need to download
-    try:
-        h = requests.head(url, timeout=30, allow_redirects=True)
-        if h.status_code >= 400:
-            raise RuntimeError(f"Remote not available (HEAD {h.status_code}): {url}")
-    except Exception as e:
-        raise RuntimeError(f"HEAD failed for {url}: {e}")
+        # Compare remote size via HEAD Content-Length to local size
+        local_size = dest.stat().st_size
+        try:
+            h = requests.head(url, timeout=30, allow_redirects=True)
+            if h.status_code >= 400:
+                # Cannot validate; proceed to re-download per user policy
+                print(f"HEAD status {h.status_code}; will re-download to ensure integrity: {url}")
+            else:
+                remote_len = h.headers.get("Content-Length") or h.headers.get("content-length")
+                if remote_len is not None:
+                    try:
+                        remote_size = int(remote_len)
+                        if remote_size == local_size:
+                            print(f"Exists and size matches remote ({local_size} bytes), skipping download: {dest}")
+                            return str(dest)
+                        else:
+                            print(f"Size mismatch (local {local_size} != remote {remote_size}); re-downloading: {dest}")
+                    except ValueError:
+                        print("Invalid Content-Length header; re-downloading to ensure integrity")
+                else:
+                    print("No Content-Length header; re-downloading to ensure integrity")
+        except Exception as e:
+            print(f"HEAD failed ({e}); re-downloading to ensure integrity: {url}")
 
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
