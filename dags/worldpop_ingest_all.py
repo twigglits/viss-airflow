@@ -192,19 +192,29 @@ def _store_file_as_large_object(stage: str, file_path: str, run_id: str):
     digest = hasher.hexdigest()
 
     with hook.get_conn() as conn, conn.cursor() as cur:
-        # Check if an identical record already exists
+        # Overwrite semantics: unlink and remove any existing rows for (stage, filename)
         cur.execute(
             """
-            SELECT id FROM raster_objects
-            WHERE stage = %s AND filename = %s AND sha256 = %s
-            LIMIT 1
+            SELECT lo_oid FROM raster_objects
+            WHERE stage = %s AND filename = %s
             """,
-            (stage, filename, digest),
+            (stage, filename),
         )
-        row = cur.fetchone()
-        if row:
-            # Duplicate detected; skip storing
-            return
+        old_rows = cur.fetchall() or []
+        for (old_oid,) in old_rows:
+            try:
+                # Unlink old large object to avoid orphan LOs
+                cur.execute("SELECT lo_unlink(%s)", (int(old_oid),))
+            except Exception:
+                pass
+        if old_rows:
+            cur.execute(
+                """
+                DELETE FROM raster_objects
+                WHERE stage = %s AND filename = %s
+                """,
+                (stage, filename),
+            )
 
         # Create the large object and stream file into it
         lo = conn.lobject(0, 'w')
@@ -239,6 +249,8 @@ def _store_lo(stage: str, file_path: str):
     _store_file_as_large_object(stage, file_path, run_id)
 
 
+
+
 # DAG factory
 for CC3 in ISO3_CODES:
     cc3u = CC3.upper()
@@ -265,27 +277,29 @@ for CC3 in ISO3_CODES:
             raw_path, wm_path, cog_path = _year_paths(cc3l, year)
             url = _year_url(cc3u, year)
 
-            # Short-circuit if COG already exists in DB
-            def _check_missing(y: int, expected_cog: str) -> bool:
+            # Short-circuit logic:
+            # - If local RAW is missing: process (return True) to re-download and regenerate downstream artifacts
+            # - Else if local WM is missing: process (return True) to recreate WM and downstream COG (overwrite)
+            # - Else if COG exists in DB: skip (return False)
+            # - Otherwise: process (return True)
+            def _check_missing(y: int, expected_raw: str, expected_wm: str, expected_cog: str) -> bool:
                 _ensure_db_objects_exist()
+                if not Path(expected_raw).exists():
+                    print(f"Local RAW missing for {cc3u} {y}: {expected_raw} -> processing year")
+                    return True
+                if not Path(expected_wm).exists():
+                    print(f"Local WM missing for {cc3u} {y}: {expected_wm} -> processing year (recreate WM & COG)")
+                    return True
                 exists = _cog_exists_in_db(Path(expected_cog).name)
                 if exists:
                     print(f"COG already in DB for {cc3u} {y}: {expected_cog} -> skipping year")
-                    return False
-                # HEAD check: if remote missing, skip this year entirely
-                try:
-                    h = requests.head(_year_url(cc3u, y), timeout=30, allow_redirects=True)
-                    if h.status_code >= 400:
-                        print(f"Remote missing for {cc3u} {y}: status={h.status_code} -> skipping year")
-                        return False
-                except Exception as e:
-                    print(f"HEAD failed for {cc3u} {y}: {e} -> skipping year")
                     return False
                 return True
 
             check_missing = ShortCircuitOperator(
                 task_id=f"check_missing_{year}",
-                python_callable=lambda y=year, c=cog_path: _check_missing(y, c),
+                python_callable=lambda y=year, r=raw_path, w=wm_path, c=cog_path: _check_missing(y, r, w, c),
+                ignore_downstream_trigger_rules=False,
             )
 
             download_raw = PythonOperator(
@@ -305,15 +319,9 @@ for CC3 in ISO3_CODES:
                 bash_command=(
                     "gdalwarp -overwrite -t_srs EPSG:3857 -r bilinear -multi "
                     "-srcnodata -99999 -dstnodata -99999 "
-                    "-co BIGTIFF=IF_NEEDED -co COMPRESS=LZW "
+                    "-co BIGTIFF=YES -co COMPRESS=LZW "
                     "{raw} {wm}"
                 ).format(raw=raw_path, wm=wm_path),
-            )
-
-            store_wm = PythonOperator(
-                task_id=f"store_wm_{year}",
-                python_callable=_store_lo,
-                op_kwargs={"stage": "warped_web_mercator", "file_path": wm_path},
             )
 
             to_cog = BashOperator(
@@ -335,6 +343,7 @@ for CC3 in ISO3_CODES:
                 op_kwargs={"stage": "cog", "file_path": cog_path},
             )
 
+
             validate_cog = BashOperator(
                 task_id=f"validate_cog_{year}",
                 bash_command=(
@@ -344,4 +353,4 @@ for CC3 in ISO3_CODES:
                 ).format(cog=cog_path),
             )
 
-            ensure_env >> check_missing >> download_raw >> store_raw >> warp_web_mercator >> store_wm >> to_cog >> store_cog >> validate_cog
+            ensure_env >> check_missing >> download_raw >> store_raw >> warp_web_mercator >> to_cog >> store_cog >> validate_cog
