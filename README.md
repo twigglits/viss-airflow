@@ -180,3 +180,50 @@ docker run --rm -v /home/jeannaude/epi/viss-frontend/frontend:/data osgeo/gdal:a
   gdalinfo /data/zaf_pop_2025_CN_100m_R2025A_v1_cog.tif | \
   grep -i -E 'coordinate|tiling|overviews|compression|NoData'
 ```
+
+Instructions for data migration from DEV client to Prod (Webserver):
+
+1. Create viss.dump file (which is a compressed db file of the postgres db)
+```
+docker compose exec postgres pg_dump -U airflow -d viss -Fc -b -f /tmp/viss.dump
+docker cp $(docker compose ps -q postgres):/tmp/viss.dump ./viss.dump
+```
+
+2. Copy from local DEV laptop to Webserver:
+```
+scp -i ~/.ssh/viss -C ./viss.dump \
+  <username_here>@<ip_address_here>:/mnt/HC_Volume_103938942/viss-$(date +%Y%m%d).dump
+```
+
+3. Then we do docker compose down on the webserver:
+```
+docker compose down
+```
+
+
+4. Need to set volume path on webserver to this (line 167 in docker-compose.yml on webserver):
+```
+- /mnt/HC_Volume_103938942/pgdata:/var/lib/postgresql/data
+```
+
+5. Then we stand up the postgres service:
+```
+docker compose up -d postgres
+```
+
+6. Flash the postgres db on the webserver:
+```
+docker compose exec postgres psql -U airflow -c "DROP DATABASE IF EXISTS viss;"
+docker compose exec postgres psql -U airflow -c "CREATE DATABASE viss OWNER airflow;"
+```
+
+7. Restore postgres db via helper container:
+```
+docker run --rm \
+  --network viss-docker-compose_default \
+  -e PGPASSWORD=airflow \
+  -v /mnt/HC_Volume_103938942:/dump:ro \
+  postgres:15-alpine \
+  sh -c "pg_restore -h postgres -U airflow -d viss -v /dump/viss.dump"
+```
+
