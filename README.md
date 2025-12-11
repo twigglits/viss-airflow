@@ -219,11 +219,6 @@ docker compose exec postgres psql -U airflow -c "CREATE DATABASE viss OWNER airf
 
 7. Restore postgres db via helper container:
 ```
-docker run --rm \
-  --network viss-docker-compose_default \
-  -e PGPASSWORD=airflow \
-  -v /mnt/HC_Volume_103938942:/dump:ro \
-  postgres:15-alpine \
-  sh -c "pg_restore -h postgres -U airflow -d viss -v /dump/viss.dump"
+docker run --rm   --network viss-docker-compose_default   -e PGPASSWORD=airflow   -v /mnt/HC_Volume_103938942:/dump:ro   postgres:15-alpine   sh -c "pg_restore -h postgres -U airflow -d viss -v /dump/viss-20251208.dump"   > pg_restore.log 2>&1
 ```
 
