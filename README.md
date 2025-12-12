@@ -108,6 +108,16 @@ docker compose logs -f airflow-scheduler
 
 ## Pre-reqs for first time startup
 
+Create the posgres volume:
+```bash
+docker volume create postgres-db-volume
+```
+
+Then start up the service:
+```bash
+docker compose up -d postgres-dev
+```
+
 Create the postgres database `viss` if it does not already exist
 ```bash
 docker compose exec postgres sh -lc "psql -U airflow -d postgres -c \"CREATE DATABASE viss OWNER airflow;\""
