@@ -123,6 +123,13 @@ Create the postgres database `viss` if it does not already exist
 docker compose exec postgres sh -lc "psql -U airflow -d postgres -c \"CREATE DATABASE viss OWNER airflow;\""
 ```
 
+Award permissions to sub folders for viss airflow instance:
+```
+sudo mkdir -p viss-airflow/logs
+sudo chown -R 50000:0 viss-airflow/logs
+sudo chmod -R u+rwX,g+rwX viss-airflow/logs
+```
+
 ## Pre-reqs for Geotiff ETL Pipeline(before each and every run)
 
 It is required to install the following apt packages inside of the airflow scheduler container for the processing of geotiff files to work in the DAG.
