@@ -57,6 +57,20 @@ DATA_ROOT.mkdir(parents=True, exist_ok=True)
 PG_CONN_ID = "viss_data_db"
 
 
+def _env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None or val == "":
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        raise ValueError(f"Invalid integer for {name}: {val!r}")
+
+
+DEFAULT_DAG_CONCURRENCY = _env_int("WORLDPOP_DAG_CONCURRENCY", 32)
+DEFAULT_MAX_ACTIVE_RUNS = _env_int("WORLDPOP_MAX_ACTIVE_RUNS", 8)
+
+
 def _year_url(cc3: str, year: int) -> str:
     cc3u = cc3.upper()
     cc3l = cc3.lower()
@@ -262,8 +276,8 @@ for CC3 in ISO3_CODES:
         start_date=datetime(2025, 1, 1),
         schedule=None,
         catchup=False,
-        concurrency=1,
-        max_active_runs=1,
+        concurrency=DEFAULT_DAG_CONCURRENCY,
+        max_active_runs=DEFAULT_MAX_ACTIVE_RUNS,
         default_args={"owner": "airflow", "retries": 1},
         tags=["worldpop", "raster", "cog", cc3u],
     ) as dag:
