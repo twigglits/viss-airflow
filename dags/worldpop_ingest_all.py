@@ -74,6 +74,12 @@ DEFAULT_DAG_CONCURRENCY = _env_int("WORLDPOP_DAG_CONCURRENCY", 32)
 DEFAULT_MAX_ACTIVE_RUNS = _env_int("WORLDPOP_MAX_ACTIVE_RUNS", 8)
 
 
+GDAL_NUM_THREADS = _env_int("WORLDPOP_GDAL_NUM_THREADS", 14)
+GDAL_CACHEMAX_MB = _env_int("WORLDPOP_GDAL_CACHEMAX_MB", 8192)
+GDAL_WM_MB = _env_int("WORLDPOP_GDAL_WM_MB", 4096)
+VSI_CACHE_SIZE_BYTES = _env_int("WORLDPOP_VSI_CACHE_SIZE_BYTES", 268435456)
+
+
 def _year_url(cc3: str, year: int) -> str:
     cc3u = cc3.upper()
     cc3l = cc3.lower()
@@ -416,10 +422,24 @@ for CC3 in ISO3_CODES:
                 task_id=f"warp_web_mercator_{year}",
                 bash_command=(
                     "gdalwarp -overwrite -t_srs EPSG:3857 -r bilinear -multi "
+                    "--config GDAL_NUM_THREADS {gdal_num_threads} "
+                    "-wo NUM_THREADS={gdal_num_threads} "
+                    "--config GDAL_CACHEMAX {gdal_cachemax_mb} "
+                    "-wm {gdal_wm_mb} "
+                    "--config VSI_CACHE TRUE "
+                    "--config VSI_CACHE_SIZE {vsi_cache_size_bytes} "
+                    "--config GDAL_DISABLE_READDIR_ON_OPEN YES "
                     "-srcnodata -99999 -dstnodata -99999 "
-                    "-co BIGTIFF=IF_NEEDED -co COMPRESS=LZW "
+                    "-co BIGTIFF=YES -co COMPRESS=LZW "
                     "{raw} {wm}"
-                ).format(raw=raw_path, wm=wm_path),
+                ).format(
+                    raw=raw_path,
+                    wm=wm_path,
+                    gdal_num_threads=GDAL_NUM_THREADS,
+                    gdal_cachemax_mb=GDAL_CACHEMAX_MB,
+                    gdal_wm_mb=GDAL_WM_MB,
+                    vsi_cache_size_bytes=VSI_CACHE_SIZE_BYTES,
+                ),
             )
 
             to_cog = BashOperator(
