@@ -70,8 +70,9 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"Invalid integer for {name}: {val!r}")
 
 
-DEFAULT_DAG_CONCURRENCY = _env_int("WORLDPOP_DAG_CONCURRENCY", 32)
-DEFAULT_MAX_ACTIVE_RUNS = _env_int("WORLDPOP_MAX_ACTIVE_RUNS", 8)
+DEFAULT_DAG_CONCURRENCY = _env_int("WORLDPOP_DAG_CONCURRENCY", 1)
+DEFAULT_MAX_ACTIVE_RUNS = _env_int("WORLDPOP_MAX_ACTIVE_RUNS", 1)
+DEFAULT_MAX_ACTIVE_TASKS = _env_int("WORLDPOP_MAX_ACTIVE_TASKS", 1)
 
 
 GDAL_NUM_THREADS = _env_int("WORLDPOP_GDAL_NUM_THREADS", 14)
@@ -361,6 +362,7 @@ for CC3 in ISO3_CODES:
         schedule=None,
         catchup=False,
         concurrency=DEFAULT_DAG_CONCURRENCY,
+        max_active_tasks=DEFAULT_MAX_ACTIVE_TASKS,
         max_active_runs=DEFAULT_MAX_ACTIVE_RUNS,
         default_args={"owner": "airflow", "retries": 1},
         tags=["worldpop", "raster", "cog", cc3u],
