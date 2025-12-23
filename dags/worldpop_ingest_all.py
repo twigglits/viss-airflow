@@ -6,6 +6,9 @@ import mimetypes
 import requests
 from typing import Iterable, List
 
+import numpy as np
+import rasterio
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator, get_current_context, ShortCircuitOperator
 from airflow.operators.bash import BashOperator
@@ -55,6 +58,27 @@ DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
 # Target Postgres connection (configure in Airflow Admin -> Connections)
 PG_CONN_ID = "viss_data_db"
+
+
+def _env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None or val == "":
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        raise ValueError(f"Invalid integer for {name}: {val!r}")
+
+
+DEFAULT_DAG_CONCURRENCY = _env_int("WORLDPOP_DAG_CONCURRENCY", 1)
+DEFAULT_MAX_ACTIVE_RUNS = _env_int("WORLDPOP_MAX_ACTIVE_RUNS", 1)
+DEFAULT_MAX_ACTIVE_TASKS = _env_int("WORLDPOP_MAX_ACTIVE_TASKS", 1)
+
+
+GDAL_NUM_THREADS = _env_int("WORLDPOP_GDAL_NUM_THREADS", 14)
+GDAL_CACHEMAX_MB = _env_int("WORLDPOP_GDAL_CACHEMAX_MB", 8192)
+GDAL_WM_MB = _env_int("WORLDPOP_GDAL_WM_MB", 4096)
+VSI_CACHE_SIZE_BYTES = _env_int("WORLDPOP_VSI_CACHE_SIZE_BYTES", 268435456)
 
 
 def _year_url(cc3: str, year: int) -> str:
@@ -110,6 +134,7 @@ def _ensure_db_objects_exist():
     """
     with hook.get_conn() as conn, conn.cursor() as cur:
         cur.execute(sql)
+        cur.execute("ALTER TABLE raster_objects ADD COLUMN IF NOT EXISTS exact_total DOUBLE PRECISION")
         # Ensure uniqueness on (stage, filename, sha256) to avoid duplicates
         cur.execute(
             """
@@ -118,6 +143,80 @@ def _ensure_db_objects_exist():
             """
         )
         conn.commit()
+
+
+def _raw_exact_total_exists(filename: str) -> bool:
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM raster_objects
+            WHERE stage = 'raw' AND filename = %s AND exact_total IS NOT NULL
+            LIMIT 1
+            """,
+            (filename,),
+        )
+        return cur.fetchone() is not None
+
+
+def _set_raw_exact_total(filename: str, total: float):
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE raster_objects
+            SET exact_total = %s
+            WHERE stage = 'raw' AND filename = %s
+            """,
+            (float(total), filename),
+        )
+        conn.commit()
+
+
+def _rio_calc_exact_total(file_path: str, filename: str, nodata: float = -99999.0, bidx: int = 1):
+    ctx = get_current_context()
+    force = ctx.get("dag_run").conf.get("force", False) if ctx.get("dag_run") else False
+
+    _ensure_db_objects_exist()
+    if not force and _raw_exact_total_exists(filename):
+        print(f"rio-calc: exact_total already present for raw:{filename}; skipping")
+        return
+
+    p = Path(file_path)
+    if not p.exists():
+        raise FileNotFoundError(f"rio-calc: RAW file missing: {file_path}")
+
+    print(f"rio-calc: computing exact_total for raw:{filename} from {file_path}")
+    total = 0.0
+    valid_count = 0
+    with rasterio.Env(GDAL_CACHEMAX=512):
+        with rasterio.open(file_path) as src:
+            if bidx < 1 or bidx > src.count:
+                raise ValueError(f"rio-calc: invalid bidx {bidx}; raster has {src.count} band(s)")
+
+            nd = float(nodata) if nodata is not None else src.nodata
+            for _, window in src.block_windows(bidx):
+                arr = src.read(bidx, window=window, masked=False)
+                if nd is not None:
+                    mask = arr == nd
+                    if mask.any():
+                        arr = np.where(mask, 0.0, arr)
+                        valid_count += int((~mask).sum())
+                    else:
+                        valid_count += int(arr.size)
+                else:
+                    mask = src.dataset_mask(window=window) == 0
+                    if mask.any():
+                        arr = np.where(mask, 0.0, arr)
+                        valid_count += int((~mask).sum())
+                    else:
+                        valid_count += int(arr.size)
+                total += float(arr.sum(dtype=np.float64))
+
+    print(f"rio-calc: computed exact_total={total} valid_count={valid_count} for raw:{filename}")
+    _set_raw_exact_total(filename, float(total))
+    print(f"rio-calc: stored exact_total for raw:{filename}")
 
 
 def _cog_exists_in_db(filename: str) -> bool:
@@ -262,8 +361,9 @@ for CC3 in ISO3_CODES:
         start_date=datetime(2025, 1, 1),
         schedule=None,
         catchup=False,
-        concurrency=1,
-        max_active_runs=1,
+        concurrency=DEFAULT_DAG_CONCURRENCY,
+        max_active_tasks=DEFAULT_MAX_ACTIVE_TASKS,
+        max_active_runs=DEFAULT_MAX_ACTIVE_RUNS,
         default_args={"owner": "airflow", "retries": 1},
         tags=["worldpop", "raster", "cog", cc3u],
     ) as dag:
@@ -314,14 +414,34 @@ for CC3 in ISO3_CODES:
                 op_kwargs={"stage": "raw", "file_path": raw_path},
             )
 
+            rio_calc = PythonOperator(
+                task_id=f"rio_calc_{year}",
+                python_callable=_rio_calc_exact_total,
+                op_kwargs={"file_path": raw_path, "filename": Path(raw_path).name},
+            )
+
             warp_web_mercator = BashOperator(
                 task_id=f"warp_web_mercator_{year}",
                 bash_command=(
                     "gdalwarp -overwrite -t_srs EPSG:3857 -r bilinear -multi "
+                    "--config GDAL_NUM_THREADS {gdal_num_threads} "
+                    "-wo NUM_THREADS={gdal_num_threads} "
+                    "--config GDAL_CACHEMAX {gdal_cachemax_mb} "
+                    "-wm {gdal_wm_mb} "
+                    "--config VSI_CACHE TRUE "
+                    "--config VSI_CACHE_SIZE {vsi_cache_size_bytes} "
+                    "--config GDAL_DISABLE_READDIR_ON_OPEN YES "
                     "-srcnodata -99999 -dstnodata -99999 "
-                    "-co BIGTIFF=IF_NEEDED -co COMPRESS=LZW "
+                    "-co BIGTIFF=YES -co COMPRESS=LZW "
                     "{raw} {wm}"
-                ).format(raw=raw_path, wm=wm_path),
+                ).format(
+                    raw=raw_path,
+                    wm=wm_path,
+                    gdal_num_threads=GDAL_NUM_THREADS,
+                    gdal_cachemax_mb=GDAL_CACHEMAX_MB,
+                    gdal_wm_mb=GDAL_WM_MB,
+                    vsi_cache_size_bytes=VSI_CACHE_SIZE_BYTES,
+                ),
             )
 
             to_cog = BashOperator(
@@ -353,4 +473,4 @@ for CC3 in ISO3_CODES:
                 ).format(cog=cog_path),
             )
 
-            ensure_env >> check_missing >> download_raw >> store_raw >> warp_web_mercator >> to_cog >> store_cog >> validate_cog
+            ensure_env >> check_missing >> download_raw >> store_raw >> rio_calc >> warp_web_mercator >> to_cog >> store_cog >> validate_cog
