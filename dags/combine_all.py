@@ -17,6 +17,8 @@ INPUT_ROOT = Path(os.environ.get("COMBINE_INPUT_ROOT", os.environ.get("AIRFLOW_D
 OUTPUT_ROOT = Path(os.environ.get("COMBINE_OUTPUT_ROOT", str(INPUT_ROOT)))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
+RAW_GLOB = os.environ.get("COMBINE_RAW_GLOB", "*.tif*")
+
 
 def _ensure_tools():
     import shutil
@@ -40,9 +42,22 @@ def _find_raw_tiffs_for_year(year: int) -> List[str]:
 
     year_s = str(year)
 
-    candidates = list(INPUT_ROOT.rglob("raw.tiff"))
+    year_root = INPUT_ROOT / year_s
+    search_root = year_root if year_root.exists() else INPUT_ROOT
+
+    candidates = list(search_root.rglob(RAW_GLOB))
     out: List[str] = []
     for p in candidates:
+        name_l = p.name.lower()
+        if name_l.endswith("_cog.tif") or name_l.endswith("_cog.tiff"):
+            continue
+        if name_l.endswith("_3857.tif") or name_l.endswith("_3857.tiff"):
+            continue
+
+        if year_root.exists():
+            out.append(str(p))
+            continue
+
         # Match by year being a full directory segment in the path
         if year_s in {part for part in p.parts}:
             out.append(str(p))
@@ -65,7 +80,14 @@ def _combine_year(year: int):
 
     inputs = _find_raw_tiffs_for_year(year)
     if not inputs:
-        raise RuntimeError(f"No inputs found for year {year}. Searched for raw.tiff under: {INPUT_ROOT}")
+        exists = INPUT_ROOT.exists()
+        year_root = INPUT_ROOT / str(year)
+        year_exists = year_root.exists()
+        raise RuntimeError(
+            "No inputs found for year "
+            f"{year}. Searched for {RAW_GLOB} under: {INPUT_ROOT} "
+            f"(exists={exists}, year_dir={year_root}, year_dir_exists={year_exists})."
+        )
 
     out_tif = OUTPUT_ROOT / f"combined_tiff_{year}.tiff"
     vrt = OUTPUT_ROOT / f"combined_tiff_{year}.vrt"
