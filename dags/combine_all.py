@@ -41,6 +41,7 @@ def _find_raw_tiffs_for_year(year: int) -> List[str]:
     """
 
     year_s = str(year)
+    year_token = f"_pop_{year_s}_"
 
     year_root = INPUT_ROOT / year_s
     search_root = year_root if year_root.exists() else INPUT_ROOT
@@ -63,8 +64,8 @@ def _find_raw_tiffs_for_year(year: int) -> List[str]:
             out.append(str(p))
             continue
 
-        # Fallback: allow year in parent directory names (e.g., "2015_something")
-        if any(year_s in part for part in p.parts):
+        # Match year encoded in the filename (e.g. "ago_pop_2015_CN_...")
+        if year_token in name_l:
             out.append(str(p))
 
     # Deterministic order
@@ -89,7 +90,7 @@ def _combine_year(year: int):
             f"(exists={exists}, year_dir={year_root}, year_dir_exists={year_exists})."
         )
 
-    out_tif = OUTPUT_ROOT / f"combined_tiff_{year}.tiff"
+    out_tif = OUTPUT_ROOT / f"combined_tiff_{year}.tif"
     vrt = OUTPUT_ROOT / f"combined_tiff_{year}.vrt"
 
     if out_tif.exists() and not force:
