@@ -10,7 +10,9 @@ import numpy as np
 import rasterio
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator, get_current_context, ShortCircuitOperator
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import BranchPythonOperator, PythonOperator, get_current_context
+from airflow.utils.trigger_rule import TriggerRule
 from airflow.operators.bash import BashOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
@@ -153,6 +155,22 @@ def _raw_exact_total_exists(filename: str) -> bool:
             SELECT 1
             FROM raster_objects
             WHERE stage = 'raw' AND filename = %s AND exact_total IS NOT NULL
+            LIMIT 1
+            """,
+            (filename,),
+        )
+        return cur.fetchone() is not None
+
+
+def _raw_exists_in_db(filename: str) -> bool:
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM raster_objects
+            WHERE stage = 'raw' AND filename = %s
+            ORDER BY id DESC
             LIMIT 1
             """,
             (filename,),
@@ -377,30 +395,41 @@ for CC3 in ISO3_CODES:
             raw_path, wm_path, cog_path = _year_paths(cc3l, year)
             url = _year_url(cc3u, year)
 
-            # Short-circuit logic:
-            # - If local RAW is missing: process (return True) to re-download and regenerate downstream artifacts
-            # - Else if local WM is missing: process (return True) to recreate WM and downstream COG (overwrite)
-            # - Else if COG exists in DB: skip (return False)
-            # - Otherwise: process (return True)
-            def _check_missing(y: int, expected_raw: str, expected_wm: str, expected_cog: str) -> bool:
+            def _check_missing(y: int, expected_raw: str, expected_wm: str, expected_cog: str) -> str:
                 _ensure_db_objects_exist()
-                if not Path(expected_raw).exists():
-                    print(f"Local RAW missing for {cc3u} {y}: {expected_raw} -> processing year")
-                    return True
-                if not Path(expected_wm).exists():
-                    print(f"Local WM missing for {cc3u} {y}: {expected_wm} -> processing year (recreate WM & COG)")
-                    return True
-                exists = _cog_exists_in_db(Path(expected_cog).name)
-                if exists:
-                    print(f"COG already in DB for {cc3u} {y}: {expected_cog} -> skipping year")
-                    return False
-                return True
+                raw_name = Path(expected_raw).name
+                cog_name = Path(expected_cog).name
 
-            check_missing = ShortCircuitOperator(
+                if not Path(expected_raw).exists():
+                    print(f"Local RAW missing for {cc3u} {y}: {expected_raw} -> start at download_raw")
+                    return f"download_raw_{y}"
+
+                if not _raw_exists_in_db(raw_name):
+                    print(f"RAW not in DB for {cc3u} {y}: {raw_name} -> start at store_raw")
+                    return f"store_raw_{y}"
+
+                if not _raw_exact_total_exists(raw_name):
+                    print(f"rio-calc exact_total missing for {cc3u} {y}: raw:{raw_name} -> start at rio_calc")
+                    return f"rio_calc_{y}"
+
+                if not Path(expected_wm).exists():
+                    print(f"Local WM missing for {cc3u} {y}: {expected_wm} -> start at warp_web_mercator")
+                    return f"warp_web_mercator_{y}"
+
+                exists = _cog_exists_in_db(cog_name)
+                if exists:
+                    print(f"COG already in DB for {cc3u} {y}: {expected_cog} and exact_total present -> skipping year")
+                    return f"skip_{y}"
+
+                print(f"COG missing in DB for {cc3u} {y}: {expected_cog} -> start at to_cog")
+                return f"to_cog_{y}"
+
+            check_missing = BranchPythonOperator(
                 task_id=f"check_missing_{year}",
                 python_callable=lambda y=year, r=raw_path, w=wm_path, c=cog_path: _check_missing(y, r, w, c),
-                ignore_downstream_trigger_rules=False,
             )
+
+            skip_year = EmptyOperator(task_id=f"skip_{year}")
 
             download_raw = PythonOperator(
                 task_id=f"download_raw_{year}",
@@ -412,12 +441,14 @@ for CC3 in ISO3_CODES:
                 task_id=f"store_raw_{year}",
                 python_callable=_store_lo,
                 op_kwargs={"stage": "raw", "file_path": raw_path},
+                trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
             )
 
             rio_calc = PythonOperator(
                 task_id=f"rio_calc_{year}",
                 python_callable=_rio_calc_exact_total,
                 op_kwargs={"file_path": raw_path, "filename": Path(raw_path).name},
+                trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
             )
 
             warp_web_mercator = BashOperator(
@@ -442,6 +473,7 @@ for CC3 in ISO3_CODES:
                     gdal_wm_mb=GDAL_WM_MB,
                     vsi_cache_size_bytes=VSI_CACHE_SIZE_BYTES,
                 ),
+                trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
             )
 
             to_cog = BashOperator(
@@ -455,12 +487,14 @@ for CC3 in ISO3_CODES:
                     "-co OVERVIEW_RESAMPLING=AVERAGE "
                     "{wm} {cog}"
                 ).format(wm=wm_path, cog=cog_path),
+                trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
             )
 
             store_cog = PythonOperator(
                 task_id=f"store_cog_{year}",
                 python_callable=_store_lo,
                 op_kwargs={"stage": "cog", "file_path": cog_path},
+                trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
             )
 
 
@@ -471,6 +505,14 @@ for CC3 in ISO3_CODES:
                     "gdalinfo {cog} | "
                     r"grep -i -E Coordinate"
                 ).format(cog=cog_path),
+                trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
             )
 
-            ensure_env >> check_missing >> download_raw >> store_raw >> rio_calc >> warp_web_mercator >> to_cog >> store_cog >> validate_cog
+            ensure_env >> check_missing
+            check_missing >> [skip_year, download_raw, store_raw, rio_calc, warp_web_mercator, to_cog]
+
+            download_raw >> store_raw
+            store_raw >> rio_calc
+            rio_calc >> warp_web_mercator
+            warp_web_mercator >> to_cog
+            to_cog >> store_cog >> validate_cog
