@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import os
 import time
+import re
 from typing import List, Tuple
 
 import requests
@@ -30,6 +31,14 @@ UN_RELEASE = os.environ.get("ASFR_RELEASE", "2024")
 # We keep a conservative delay between calls.
 REQUEST_DELAY_SECONDS = float(os.environ.get("UN_DP_REQUEST_DELAY_SECONDS", "2.5"))
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("UN_DP_REQUEST_TIMEOUT_SECONDS", "60"))
+ASFR_DEBUG = os.environ.get("ASFR_DEBUG", "").strip().lower() in ("1", "true", "yes", "y")
+
+ASFR_VARIANT_CANDIDATES: dict[str, List[str]] = {
+    # Store standardized variant_short_name keys on output; pick the first available underlying variant.
+    "LOWER95": ["LOWER95", "LOWER80", "LOW"],
+    "MEDIAN": ["MEDIAN", "EST", "ESTIMATE", "MAIN"],
+    "UPPER95": ["UPPER95", "UPPER80", "HIGH"],
+}
 
 
 def _auth_headers() -> dict:
@@ -45,21 +54,69 @@ def _auth_headers() -> dict:
 
 def _ensure_db_tables_exist():
     hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
-    sql = """
-    CREATE TABLE IF NOT EXISTS asfr_5yr (
-        iso3 TEXT NOT NULL,
-        year INTEGER NOT NULL,
-        age_min INTEGER NOT NULL,
-        age_max INTEGER NOT NULL,
-        asfr DOUBLE PRECISION NOT NULL,
-        source TEXT NOT NULL,
-        release TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (iso3, year, age_min, age_max, source, release)
-    );
-    """
     with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql)
+        # Create table in the desired shape if it doesn't exist.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS asfr_5yr (
+                iso3 TEXT NOT NULL,
+                year INTEGER NOT NULL,
+                variant_short_name TEXT NOT NULL,
+                age_min INTEGER NOT NULL,
+                age_max INTEGER NOT NULL,
+                asfr DOUBLE PRECISION NOT NULL,
+                source TEXT NOT NULL,
+                release TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (iso3, year, variant_short_name, age_min, age_max, source, release)
+            );
+            """
+        )
+
+        # Idempotent migration from older schema (without variant_short_name).
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = 'asfr_5yr' AND column_name = 'variant_short_name'
+            """
+        )
+        has_variant = cur.fetchone() is not None
+        if not has_variant:
+            cur.execute("ALTER TABLE asfr_5yr ADD COLUMN variant_short_name TEXT")
+            cur.execute("UPDATE asfr_5yr SET variant_short_name = 'MEDIAN' WHERE variant_short_name IS NULL")
+            cur.execute("ALTER TABLE asfr_5yr ALTER COLUMN variant_short_name SET NOT NULL")
+
+        # Ensure primary key includes variant_short_name.
+        cur.execute(
+            """
+            SELECT constraint_name
+            FROM information_schema.table_constraints
+            WHERE table_name = 'asfr_5yr' AND constraint_type = 'PRIMARY KEY'
+            """
+        )
+        pk = cur.fetchone()
+        if pk is not None:
+            pk_name = pk[0]
+            cur.execute(
+                """
+                SELECT kcu.column_name
+                FROM information_schema.key_column_usage kcu
+                WHERE kcu.table_name = 'asfr_5yr' AND kcu.constraint_name = %s
+                ORDER BY kcu.ordinal_position
+                """,
+                (pk_name,),
+            )
+            pk_cols = [r[0] for r in cur.fetchall()]
+            if "variant_short_name" not in pk_cols:
+                cur.execute(f"ALTER TABLE asfr_5yr DROP CONSTRAINT {pk_name}")
+                cur.execute(
+                    """
+                    ALTER TABLE asfr_5yr
+                    ADD CONSTRAINT asfr_5yr_pkey
+                    PRIMARY KEY (iso3, year, variant_short_name, age_min, age_max, source, release)
+                    """
+                )
         conn.commit()
 
 
@@ -115,7 +172,57 @@ def _get_first_present(d: dict, keys: Tuple[str, ...]):
     return None
 
 
-def _fetch_asfr_rows(location_id: int, indicator_id: int, year: int) -> List[Tuple[int, int, float]]:
+def _parse_age_bin(r: dict) -> Tuple[int, int] | None:
+    age_min_raw = _get_first_present(
+        r,
+        (
+            "ageStart",
+            "AgeStart",
+            "age_start",
+            "ageGrpStart",
+            "AgeGrpStart",
+            "ageGroupStart",
+        ),
+    )
+    age_max_raw = _get_first_present(
+        r,
+        (
+            "ageEnd",
+            "AgeEnd",
+            "age_end",
+            "ageGrpEnd",
+            "AgeGrpEnd",
+            "ageGroupEnd",
+        ),
+    )
+
+    # Some responses omit ageEnd but provide an ageLabel like "40-44".
+    if age_min_raw is None:
+        age_label = _get_first_present(r, ("ageLabel", "AgeLabel"))
+        if isinstance(age_label, str):
+            m = re.match(r"^\s*(\d+)\s*[-–]\s*(\d+)\s*$", age_label)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+        return None
+
+    try:
+        age_min = int(age_min_raw)
+    except Exception:
+        return None
+
+    if age_max_raw is None:
+        # Treat as single-year bin when ageEnd is missing.
+        return age_min, age_min
+
+    try:
+        age_max = int(age_max_raw)
+    except Exception:
+        return None
+
+    return age_min, age_max
+
+
+def _fetch_asfr_rows(location_id: int, indicator_id: int, year: int) -> List[Tuple[str, int, int, float]]:
     url = (
         f"{UN_BASE}/api/v1/data/indicators/{indicator_id}/locations/{location_id}/start/{year}/end/{year}"
     )
@@ -125,80 +232,109 @@ def _fetch_asfr_rows(location_id: int, indicator_id: int, year: int) -> List[Tup
     if not dict_rows:
         return []
 
-    # Decide which sex to ingest.
-    sex_ids = set()
+    # Group by (sexId, variantShortName) so we can select specific uncertainty bounds.
+    groups: dict[tuple[int, str], list[dict]] = {}
     for r in dict_rows:
-        s = _get_first_present(r, ("sexId", "SexID", "sex_id", "SexId"))
-        if s is not None:
-            try:
-                sex_ids.add(int(s))
-            except Exception:
-                pass
-
-    # Prefer female (2). If only both sexes (3) is available, fall back.
-    preferred_sex_id = 2 if 2 in sex_ids else (3 if 3 in sex_ids else None)
-
-    out: List[Tuple[int, int, float]] = []
-
-    for r in dict_rows:
-        # Sex filter (only if the response includes sexId)
         sex_raw = _get_first_present(r, ("sexId", "SexID", "sex_id", "SexId"))
-        if preferred_sex_id is not None and sex_raw is not None:
-            try:
-                if int(sex_raw) != preferred_sex_id:
-                    continue
-            except Exception:
-                continue
-
-        age_min_raw = _get_first_present(
-            r,
-            (
-                "ageStart",
-                "AgeStart",
-                "age_start",
-                "ageGrpStart",
-                "AgeGrpStart",
-                "ageGroupStart",
-            ),
-        )
-        age_max_raw = _get_first_present(
-            r,
-            (
-                "ageEnd",
-                "AgeEnd",
-                "age_end",
-                "ageGrpEnd",
-                "AgeGrpEnd",
-                "ageGroupEnd",
-            ),
-        )
-        val_raw = _get_first_present(r, ("value", "Value", "val", "Val"))
-
-        if age_min_raw is None or age_max_raw is None or val_raw is None:
+        var_raw = _get_first_present(r, ("variantShortName", "VariantShortName"))
+        if sex_raw is None or var_raw is None:
             continue
-
         try:
-            age_min = int(age_min_raw)
-            age_max = int(age_max_raw)
-            val = float(val_raw)
+            sex_id = int(sex_raw)
         except Exception:
             continue
-
-        # Keep fertility ages 15-49.
-        if age_min < 15 or age_max > 49:
+        if not isinstance(var_raw, str) or not var_raw.strip():
             continue
+        # Normalize to avoid mismatches like 'Median' vs 'MEDIAN'.
+        variant = var_raw.strip().upper()
+        groups.setdefault((sex_id, variant), []).append(r)
 
-        out.append((age_min, age_max, val))
-
-    out.sort(key=lambda t: t[0])
-    if not out:
+    if not groups:
         first_row = dict_rows[0]
-        print(
-            "UN ASFR response contained 0 parsed bins. "
-            f"sex_ids={sorted(sex_ids)} preferred_sex_id={preferred_sex_id}"
-        )
+        print("UN ASFR response had no groupable rows (missing sexId/variantShortName)")
         print(f"UN ASFR first row keys={list(first_row.keys())}")
         print(f"UN ASFR first row sample={first_row}")
+        return []
+
+    if ASFR_DEBUG and year in (2024, 2025):
+        group_summaries: List[Tuple[int, int, str, List[Tuple[int, int]]]] = []
+        for (sex_id, variant), rs in groups.items():
+            uniq = set()
+            for r in rs:
+                ab = _parse_age_bin(r)
+                if ab is None:
+                    continue
+                a0, a1 = ab
+                if a0 < 15 or a1 > 49:
+                    continue
+                uniq.add((a0, a1))
+            bins = sorted(list(uniq), key=lambda t: (t[0], t[1]))
+            group_summaries.append((len(bins), sex_id, variant, bins))
+
+        group_summaries.sort(key=lambda t: (t[0], 1 if t[1] == 2 else (0 if t[1] == 3 else -1)), reverse=True)
+        print(f"ASFR_DEBUG year={year}: group summaries (top 10)")
+        for bins_count, sex_id, variant, bins in group_summaries[:10]:
+            head = bins[:10]
+            tail = bins[-10:] if len(bins) > 10 else []
+            print(
+                f"  sexId={sex_id} variant={variant} bins_15_49={bins_count} "
+                f"head={head} tail={tail}"
+            )
+
+    sex_ids = {k[0] for k in groups.keys()}
+    selected_sex_id: int | None = None
+    if 2 in sex_ids:
+        selected_sex_id = 2
+    elif 3 in sex_ids:
+        selected_sex_id = 3
+        print(
+            f"WARNING: No female (sexId=2) ASFR rows returned for year={year}; using sexId=3 (both sexes)"
+        )
+    else:
+        print(f"WARNING: No usable sexId (2 or 3) ASFR rows returned for year={year}; skipping")
+        return []
+
+    assert selected_sex_id is not None
+
+    chosen_underlying: dict[str, str] = {}
+    for out_variant, candidates in ASFR_VARIANT_CANDIDATES.items():
+        found = None
+        for cand in candidates:
+            if (selected_sex_id, cand) in groups:
+                found = cand
+                break
+        if found is None:
+            available = sorted(list({v for (sid, v) in groups.keys() if sid == selected_sex_id}))
+            print(
+                "WARNING: Missing required ASFR variant; skipping year="
+                f"{year} sexId={selected_sex_id} missing_bucket={out_variant} candidates={candidates} available_variants={available}"
+            )
+            return []
+        chosen_underlying[out_variant] = found
+
+    out: List[Tuple[str, int, int, float]] = []
+    for out_variant, underlying_variant in chosen_underlying.items():
+        rs = groups[(selected_sex_id, underlying_variant)]
+        for r in rs:
+            val_raw = _get_first_present(r, ("value", "Value", "val", "Val"))
+            ab = _parse_age_bin(r)
+            if ab is None or val_raw is None:
+                continue
+            age_min, age_max = ab
+            try:
+                val = float(val_raw)
+            except Exception:
+                continue
+            if age_min < 15 or age_max > 49:
+                continue
+            out.append((out_variant, age_min, age_max, val))
+
+    print(
+        f"Selected ASFR variants for year={year} sexId={selected_sex_id}: "
+        + ", ".join([f"{k}<-{v}" for k, v in chosen_underlying.items()])
+    )
+
+    out.sort(key=lambda t: (t[0], t[1]))
     return out
 
 
@@ -221,7 +357,9 @@ def ingest_asfr_sur_2015_2025():
         for year in YEARS:
             bins = _fetch_asfr_rows(location_id, indicator_id, year)
             if not bins:
-                raise RuntimeError(f"No ASFR rows returned for iso3={ISO3} year={year}")
+                print(f"WARNING: Skipping ASFR ingest for iso3={ISO3} year={year} (no female data)")
+                time.sleep(REQUEST_DELAY_SECONDS)
+                continue
 
             # Overwrite semantics: remove any prior outputs for this iso3/year so stale bins don't linger.
             cur.execute(
@@ -229,17 +367,18 @@ def ingest_asfr_sur_2015_2025():
                 (ISO3, int(year)),
             )
 
-            for age_min, age_max, asfr in bins:
+            for variant_short_name, age_min, age_max, asfr in bins:
                 cur.execute(
                     """
-                    INSERT INTO asfr_5yr (iso3, year, age_min, age_max, asfr, source, release)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (iso3, year, age_min, age_max, source, release)
+                    INSERT INTO asfr_5yr (iso3, year, variant_short_name, age_min, age_max, asfr, source, release)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (iso3, year, variant_short_name, age_min, age_max, source, release)
                     DO UPDATE SET asfr = EXCLUDED.asfr
                     """,
                     (
                         ISO3,
                         int(year),
+                        str(variant_short_name),
                         int(age_min),
                         int(age_max),
                         float(asfr),
