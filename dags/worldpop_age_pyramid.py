@@ -22,7 +22,42 @@ DATA_ROOT.mkdir(parents=True, exist_ok=True)
 PG_CONN_ID = "viss_data_db"
 
 # Country/year selection (override via env)
-ISO3 = os.environ.get("AGEPYR_ISO3", "SUR").upper()
+ISO3_CODES: List[str] = [
+    'ABW','AFG','AGO','AIA','ALA','ALB','AND','ARE','ARG','ARM','ASM','ATA','ATF','ATG','AUS','AUT','AZE',
+    'BDI','BEL','BEN','BES','BFA','BGD','BGR','BHR','BHS','BIH','BLM','BLR','BLZ','BMU','BOL','BRA','BRB','BRN','BTN','BVT','BWA',
+    'CAF','CAN','CCK','CHE','CHL','CHN','CIV','CMR','COD','COG','COK','COL','COM','CPV','CRI','CUB','CUW','CXR','CYM','CYP','CZE',
+    'DEU','DJI','DMA','DNK','DOM','DZA',
+    'ECU','EGY','ERI','ESH','ESP','EST','ETH',
+    'FIN','FJI','FLK','FRA','FRO',
+    'GAB','GBR','GEO','GGY','GHA','GIB','GIN','GLP','GMB','GNB','GNQ','GRC','GRD','GRL','GTM','GUF','GUM','GUY',
+    'HKG','HMD','HND','HRV','HTI','HUN',
+    'IDN','IMN','IND','IOT','IRL','IRN','IRQ','ISL','ISR','ITA',
+    'JAM','JEY','JOR','JPN',
+    'KAZ','KEN','KGZ','KHM','KIR','KNA','KOR','KWT',
+    'LAO','LBN','LBR','LBY','LCA','LIE','LKA','LSO','LTU','LUX','LVA',
+    'MAC','MAF','MAR','MCO','MDA','MDG','MDV','MEX','MHL','MKD','MLI','MLT','MMR','MNE','MNG','MNP','MOZ','MRT','MSR','MTQ','MUS','MWI','MYS',
+    'MYT','NAM','NCL','NER','NFK','NGA','NIC','NIU','NLD','NOR','NPL','NRU','NZL',
+    'OMN',
+    'PAK','PAN','PCN','PER','PHL','PLW','PNG','POL','PRI','PRK','PRT','PRY','PSE','PYF',
+    'QAT',
+    'REU','ROU','RUS','RWA',
+    'SAU','SDN','SEN','SGP','SGS','SHN','SJM','SLB','SLE','SLV','SMR','SOM','SPM','SRB','SSD','STP','SUR','SVK','SVN','SWE','SWZ','SXM','SYC','SYR',
+    'TCA','TCD','TGO','THA','TJK','TKL','TKM','TLS','TON','TTO','TUN','TUR','TUV','TWN','TZA',
+    'UGA','UKR','UMI','URY','USA','UZB',
+    'VAT','VCT','VEN','VGB','VIR','VNM','VUT',
+    'WLF','WSM',
+    'YEM',
+    'ZAF','ZMB','ZWE',
+]
+
+_ENV_COUNTRIES = os.getenv("AGEPYR_COUNTRIES")
+if _ENV_COUNTRIES:
+    WANT = {c.strip().upper() for c in _ENV_COUNTRIES.split(',') if c.strip()}
+    ISO3_CODES = [c for c in ISO3_CODES if c in WANT]
+else:
+    _ISO3_ENV = (os.getenv("AGEPYR_ISO3") or "").strip().upper()
+    if _ISO3_ENV:
+        ISO3_CODES = [_ISO3_ENV]
 YEAR_START = int(os.environ.get("AGEPYR_YEAR_START", "2015"))
 YEAR_END = int(os.environ.get("AGEPYR_YEAR_END", "2025"))
 YEARS: List[int] = list(range(YEAR_START, YEAR_END + 1))
@@ -204,19 +239,26 @@ def build_age_pyramid_year(iso3: str, year: int):
     return csv_path
 
 
-with DAG(
-    dag_id="worldpop_age_pyramid_5yr",
-    description="Compute age pyramid (5-year bins) from WorldPop AgeSex_structures for a country and store to Postgres + CSV",
-    start_date=datetime(2025, 1, 1),
-    schedule=None,
-    catchup=False,
-    max_active_runs=1,
-    default_args={"owner": "airflow", "retries": 1},
-    tags=["worldpop", "age_pyramid", "demography"],
-) as dag:
-    for year in YEARS:
-        PythonOperator(
-            task_id=f"age_pyramid_{ISO3.lower()}_{year}",
-            python_callable=build_age_pyramid_year,
-            op_kwargs={"iso3": ISO3, "year": year},
-        )
+for CC3 in ISO3_CODES:
+    cc3u = CC3.upper()
+    cc3l = CC3.lower()
+
+    with DAG(
+        dag_id=f"worldpop_age_pyramid_5yr_{cc3l}_{YEAR_START}_{YEAR_END}",
+        description=(
+            f"Compute age pyramid (5-year bins) from WorldPop AgeSex_structures for {cc3u} "
+            "and store to Postgres + CSV"
+        ),
+        start_date=datetime(2025, 1, 1),
+        schedule=None,
+        catchup=False,
+        max_active_runs=1,
+        default_args={"owner": "airflow", "retries": 1},
+        tags=["worldpop", "age_pyramid", "demography", cc3u],
+    ) as dag:
+        for year in YEARS:
+            PythonOperator(
+                task_id=f"age_pyramid_{cc3l}_{year}",
+                python_callable=build_age_pyramid_year,
+                op_kwargs={"iso3": cc3u, "year": year},
+            )
