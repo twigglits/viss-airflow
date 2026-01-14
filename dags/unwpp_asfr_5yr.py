@@ -15,7 +15,42 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 PG_CONN_ID = "viss_data_db"
 
-ISO3 = os.environ.get("ASFR_ISO3", "SUR").upper()
+ISO3_CODES: List[str] = [
+    'ABW','AFG','AGO','AIA','ALA','ALB','AND','ARE','ARG','ARM','ASM','ATA','ATF','ATG','AUS','AUT','AZE',
+    'BDI','BEL','BEN','BES','BFA','BGD','BGR','BHR','BHS','BIH','BLM','BLR','BLZ','BMU','BOL','BRA','BRB','BRN','BTN','BVT','BWA',
+    'CAF','CAN','CCK','CHE','CHL','CHN','CIV','CMR','COD','COG','COK','COL','COM','CPV','CRI','CUB','CUW','CXR','CYM','CYP','CZE',
+    'DEU','DJI','DMA','DNK','DOM','DZA',
+    'ECU','EGY','ERI','ESH','ESP','EST','ETH',
+    'FIN','FJI','FLK','FRA','FRO',
+    'GAB','GBR','GEO','GGY','GHA','GIB','GIN','GLP','GMB','GNB','GNQ','GRC','GRD','GRL','GTM','GUF','GUM','GUY',
+    'HKG','HMD','HND','HRV','HTI','HUN',
+    'IDN','IMN','IND','IOT','IRL','IRN','IRQ','ISL','ISR','ITA',
+    'JAM','JEY','JOR','JPN',
+    'KAZ','KEN','KGZ','KHM','KIR','KNA','KOR','KWT',
+    'LAO','LBN','LBR','LBY','LCA','LIE','LKA','LSO','LTU','LUX','LVA',
+    'MAC','MAF','MAR','MCO','MDA','MDG','MDV','MEX','MHL','MKD','MLI','MLT','MMR','MNE','MNG','MNP','MOZ','MRT','MSR','MTQ','MUS','MWI','MYS',
+    'MYT','NAM','NCL','NER','NFK','NGA','NIC','NIU','NLD','NOR','NPL','NRU','NZL',
+    'OMN',
+    'PAK','PAN','PCN','PER','PHL','PLW','PNG','POL','PRI','PRK','PRT','PRY','PSE','PYF',
+    'QAT',
+    'REU','ROU','RUS','RWA',
+    'SAU','SDN','SEN','SGP','SGS','SHN','SJM','SLB','SLE','SLV','SMR','SOM','SPM','SRB','SSD','STP','SUR','SVK','SVN','SWE','SWZ','SXM','SYC','SYR',
+    'TCA','TCD','TGO','THA','TJK','TKL','TKM','TLS','TON','TTO','TUN','TUR','TUV','TWN','TZA',
+    'UGA','UKR','UMI','URY','USA','UZB',
+    'VAT','VCT','VEN','VGB','VIR','VNM','VUT',
+    'WLF','WSM',
+    'YEM',
+    'ZAF','ZMB','ZWE',
+]
+
+_ENV_COUNTRIES = os.getenv("ASFR_COUNTRIES")
+if _ENV_COUNTRIES:
+    WANT = {c.strip().upper() for c in _ENV_COUNTRIES.split(',') if c.strip()}
+    ISO3_CODES = [c for c in ISO3_CODES if c in WANT]
+else:
+    _ISO3_ENV = (os.getenv("ASFR_ISO3") or "").strip().upper()
+    if _ISO3_ENV:
+        ISO3_CODES = [_ISO3_ENV]
 YEAR_START = int(os.environ.get("ASFR_YEAR_START", "2015"))
 YEAR_END = int(os.environ.get("ASFR_YEAR_END", "2025"))
 YEARS: List[int] = list(range(YEAR_START, YEAR_END + 1))
@@ -338,15 +373,11 @@ def _fetch_asfr_rows(location_id: int, indicator_id: int, year: int) -> List[Tup
     return out
 
 
-def ingest_asfr_sur_2015_2025():
-    if ISO3 != "SUR":
-        raise RuntimeError("This DAG is currently scoped to SUR only. Override ASFR_ISO3 if needed.")
-    if YEAR_START != 2015 or YEAR_END != 2025:
-        raise RuntimeError("This DAG is currently scoped to years 2015-2025 only. Override ASFR_YEAR_START/END if needed.")
-
+def ingest_asfr_country(iso3: str):
+    iso3 = str(iso3).upper().strip()
     _ensure_db_tables_exist()
 
-    location_id = _resolve_location_id(ISO3)
+    location_id = _resolve_location_id(iso3)
     time.sleep(REQUEST_DELAY_SECONDS)
 
     indicator_id, _indicator_name = _resolve_indicator_id("ASFR5")
@@ -357,14 +388,14 @@ def ingest_asfr_sur_2015_2025():
         for year in YEARS:
             bins = _fetch_asfr_rows(location_id, indicator_id, year)
             if not bins:
-                print(f"WARNING: Skipping ASFR ingest for iso3={ISO3} year={year} (no female data)")
+                print(f"WARNING: Skipping ASFR ingest for iso3={iso3} year={year} (no female data)")
                 time.sleep(REQUEST_DELAY_SECONDS)
                 continue
 
             # Overwrite semantics: remove any prior outputs for this iso3/year so stale bins don't linger.
             cur.execute(
                 "DELETE FROM asfr_5yr WHERE iso3 = %s AND year = %s",
-                (ISO3, int(year)),
+                (iso3, int(year)),
             )
 
             for variant_short_name, age_min, age_max, asfr in bins:
@@ -376,7 +407,7 @@ def ingest_asfr_sur_2015_2025():
                     DO UPDATE SET asfr = EXCLUDED.asfr
                     """,
                     (
-                        ISO3,
+                        iso3,
                         int(year),
                         str(variant_short_name),
                         int(age_min),
@@ -387,22 +418,30 @@ def ingest_asfr_sur_2015_2025():
                     ),
                 )
             conn.commit()
-            print(f"Stored ASFR bins in Postgres: iso3={ISO3} year={year} bins={len(bins)}")
+            print(f"Stored ASFR bins in Postgres: iso3={iso3} year={year} bins={len(bins)}")
 
             time.sleep(REQUEST_DELAY_SECONDS)
 
 
-with DAG(
-    dag_id="unwpp_asfr_5yr_sur_2015_2025",
-    description="Ingest ASFR 5-year fertility rates for Suriname (SUR) 2015-2025 from UN Data Portal API into Postgres",
-    start_date=datetime(2025, 1, 1),
-    schedule=None,
-    catchup=False,
-    max_active_runs=1,
-    default_args={"owner": "airflow", "retries": 2},
-    tags=["un", "wpp", "asfr", "demography"],
-) as dag:
-    PythonOperator(
-        task_id="ingest_asfr_sur_2015_2025",
-        python_callable=ingest_asfr_sur_2015_2025,
-    )
+for CC3 in ISO3_CODES:
+    cc3u = CC3.upper()
+    cc3l = CC3.lower()
+
+    with DAG(
+        dag_id=f"unwpp_asfr_5yr_{cc3l}_{YEAR_START}_{YEAR_END}",
+        description=(
+            f"Ingest ASFR 5-year fertility rates for {cc3u} {YEAR_START}-{YEAR_END} "
+            "from UN Data Portal API into Postgres"
+        ),
+        start_date=datetime(2025, 1, 1),
+        schedule=None,
+        catchup=False,
+        max_active_runs=1,
+        default_args={"owner": "airflow", "retries": 2},
+        tags=["un", "wpp", "asfr", "demography", cc3u],
+    ) as dag:
+        PythonOperator(
+            task_id=f"ingest_asfr_{cc3l}_{YEAR_START}_{YEAR_END}",
+            python_callable=ingest_asfr_country,
+            op_kwargs={"iso3": cc3u},
+        )
