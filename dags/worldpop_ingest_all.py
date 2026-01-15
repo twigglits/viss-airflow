@@ -21,15 +21,15 @@ YEARS: List[int] = list(range(2015, 2026))
 
 # Full ISO 3166-1 alpha-3 list (static)
 ISO3_CODES: List[str] = [
-    'ABW','AFG','AGO','AIA','ALA','ALB','AND','ARE','ARG','ARM','ASM','ATA','ATF','ATG','AUS','AUT','AZE',
-    'BDI','BEL','BEN','BES','BFA','BGD','BGR','BHR','BHS','BIH','BLM','BLR','BLZ','BMU','BOL','BRA','BRB','BRN','BTN','BVT','BWA',
+    'ABW','AFG','AGO','AIA','ALA','ALB','AND','ARE','ARG','ARM','ASM','ATG','AUS','AUT','AZE',
+    'BDI','BEL','BEN','BES','BFA','BGD','BGR','BHR','BHS','BIH','BLM','BLR','BLZ','BMU','BOL','BRA','BRB','BRN','BTN','BWA',
     'CAF','CAN','CCK','CHE','CHL','CHN','CIV','CMR','COD','COG','COK','COL','COM','CPV','CRI','CUB','CUW','CXR','CYM','CYP','CZE',
     'DEU','DJI','DMA','DNK','DOM','DZA',
     'ECU','EGY','ERI','ESH','ESP','EST','ETH',
     'FIN','FJI','FLK','FRA','FRO',
     'GAB','GBR','GEO','GGY','GHA','GIB','GIN','GLP','GMB','GNB','GNQ','GRC','GRD','GRL','GTM','GUF','GUM','GUY',
-    'HKG','HMD','HND','HRV','HTI','HUN',
-    'IDN','IMN','IND','IOT','IRL','IRN','IRQ','ISL','ISR','ITA',
+    'HKG','HND','HRV','HTI','HUN',
+    'IDN','IMN','IND','IRL','IRN','IRQ','ISL','ISR','ITA',
     'JAM','JEY','JOR','JPN',
     'KAZ','KEN','KGZ','KHM','KIR','KNA','KOR','KWT',
     'LAO','LBN','LBR','LBY','LCA','LIE','LKA','LSO','LTU','LUX','LVA',
