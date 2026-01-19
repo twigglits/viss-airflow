@@ -17,7 +17,8 @@ INPUT_ROOT = Path(os.environ.get("COMBINE_INPUT_ROOT", os.environ.get("AIRFLOW_D
 OUTPUT_ROOT = Path(os.environ.get("COMBINE_OUTPUT_ROOT", str(INPUT_ROOT)))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-RAW_GLOB = os.environ.get("COMBINE_RAW_GLOB", "*.tif*")
+COG_SUFFIXES = ("_cog.tif", "_cog.tiff")
+COG_GLOB = os.environ.get("COMBINE_COG_GLOB", "*_cog.tif*")
 
 
 def _ensure_tools():
@@ -30,45 +31,35 @@ def _ensure_tools():
         )
 
 
-def _find_raw_tiffs_for_year(year: int) -> List[str]:
-    """Find raw.tiff files for a given year.
+def _find_cogs_for_year(year: int) -> List[str]:
+    """Find per-country WorldPop population COGs for a given year.
 
-    Expected layouts supported:
-    - <INPUT_ROOT>/<year>/<country>/raw.tiff
-    - any nested path where a path segment equals the year and the filename is raw.tiff
+    We only want to mosaic the *COG outputs* produced by the ingest pipeline, i.e.
+    filenames like:
 
-    If your data uses a different layout, set COMBINE_INPUT_ROOT and/or adjust this matcher.
+      <iso3>_pop_<year>_CN_100m_R2025A_v1_cog.tif
+
+    This matcher intentionally does NOT recurse into subdirectories to avoid picking
+    up unrelated TIFFs.
     """
 
     year_s = str(year)
     year_token = f"_pop_{year_s}_"
 
-    year_root = INPUT_ROOT / year_s
-    search_root = year_root if year_root.exists() else INPUT_ROOT
-
-    candidates = list(search_root.rglob(RAW_GLOB))
+    candidates = list(INPUT_ROOT.glob(COG_GLOB))
     out: List[str] = []
     for p in candidates:
+        if not p.is_file():
+            continue
         name_l = p.name.lower()
-        if name_l.endswith("_cog.tif") or name_l.endswith("_cog.tiff"):
+        if not name_l.endswith(COG_SUFFIXES):
             continue
-        if name_l.endswith("_3857.tif") or name_l.endswith("_3857.tiff"):
+        if name_l.endswith(".partial"):
             continue
-
-        if year_root.exists():
-            out.append(str(p))
+        if year_token not in name_l:
             continue
+        out.append(str(p))
 
-        # Match by year being a full directory segment in the path
-        if year_s in {part for part in p.parts}:
-            out.append(str(p))
-            continue
-
-        # Match year encoded in the filename (e.g. "ago_pop_2015_CN_...")
-        if year_token in name_l:
-            out.append(str(p))
-
-    # Deterministic order
     out.sort()
     return out
 
@@ -79,25 +70,23 @@ def _combine_year(year: int):
     ctx = get_current_context()
     force = ctx.get("dag_run").conf.get("force", False) if ctx.get("dag_run") else False
 
-    inputs = _find_raw_tiffs_for_year(year)
+    inputs = _find_cogs_for_year(year)
     if not inputs:
         exists = INPUT_ROOT.exists()
-        year_root = INPUT_ROOT / str(year)
-        year_exists = year_root.exists()
         raise RuntimeError(
             "No inputs found for year "
-            f"{year}. Searched for {RAW_GLOB} under: {INPUT_ROOT} "
-            f"(exists={exists}, year_dir={year_root}, year_dir_exists={year_exists})."
+            f"{year}. Searched for COGs matching {COG_GLOB} under: {INPUT_ROOT} "
+            f"(exists={exists})."
         )
 
-    out_tif = OUTPUT_ROOT / f"combined_tiff_{year}.tif"
-    vrt = OUTPUT_ROOT / f"combined_tiff_{year}.vrt"
+    out_tif = OUTPUT_ROOT / f"combined_pop_{year}_cog.tif"
+    vrt = OUTPUT_ROOT / f"combined_pop_{year}.vrt"
 
     if out_tif.exists() and not force:
         print(f"Output exists, skipping (use dag_run.conf.force=true to overwrite): {out_tif}")
         return str(out_tif)
 
-    # Build VRT and translate to GeoTIFF mosaic
+    # Build VRT and translate to a COG mosaic.
     # Note: gdalbuildvrt handles differing extents/resolutions better than a naive merge.
     import subprocess
 
@@ -111,7 +100,7 @@ def _combine_year(year: int):
     translate_cmd = [
         "gdal_translate",
         "-of",
-        "GTiff",
+        "COG",
         "-co",
         "BIGTIFF=IF_NEEDED",
         "-co",
@@ -136,7 +125,7 @@ def _combine_year(year: int):
 
 with DAG(
     dag_id="combine_all",
-    description="Combine all country raw.tiff files per year into combined_tiff_<year>.tiff",
+    description="Combine all country population COGs per year into combined_pop_<year>_cog.tif",
     start_date=datetime(2025, 1, 1),
     schedule=None,
     catchup=False,
