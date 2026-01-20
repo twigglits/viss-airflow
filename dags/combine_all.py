@@ -2,9 +2,12 @@ from datetime import datetime
 from pathlib import Path
 import os
 from typing import List
+import hashlib
+import mimetypes
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator, get_current_context
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 
 # Years to process (inclusive)
@@ -19,6 +22,10 @@ OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 COG_SUFFIXES = ("_cog.tif", "_cog.tiff")
 COG_GLOB = os.environ.get("COMBINE_COG_GLOB", "*_cog.tif*")
+
+# Connection used by DAGs to store raster objects in Postgres within this stack.
+# docker-compose.yml provides AIRFLOW_CONN_VISS_DATA_DB, which maps to conn_id: viss_data_db
+PG_CONN_ID = os.environ.get("PG_CONN_ID", os.environ.get("COMBINE_PG_CONN_ID", "viss_data_db"))
 
 
 def _ensure_tools():
@@ -62,6 +69,125 @@ def _find_cogs_for_year(year: int) -> List[str]:
 
     out.sort()
     return out
+
+
+def _ensure_db_objects_exist():
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    sql = """
+    CREATE TABLE IF NOT EXISTS raster_objects (
+        id SERIAL PRIMARY KEY,
+        stage TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        sha256 TEXT,
+        size_bytes BIGINT,
+        content_type TEXT,
+        lo_oid OID NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql)
+        cur.execute("ALTER TABLE raster_objects ADD COLUMN IF NOT EXISTS exact_total DOUBLE PRECISION")
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS raster_objects_unique_idx
+            ON raster_objects(stage, filename, sha256)
+            """
+        )
+        conn.commit()
+
+
+def _cog_exists_in_db(filename: str) -> bool:
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM raster_objects
+            WHERE stage = 'cog' AND filename = %s
+            ORDER BY id DESC LIMIT 1
+            """,
+            (filename,),
+        )
+        return cur.fetchone() is not None
+
+
+def _store_file_as_large_object(stage: str, file_path: str, run_id: str):
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    file_path_p = Path(file_path)
+    filename = file_path_p.name
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+    hasher = hashlib.sha256()
+    size = 0
+    with open(file_path_p, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+            size += len(chunk)
+    digest = hasher.hexdigest()
+
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT lo_oid FROM raster_objects
+            WHERE stage = %s AND filename = %s
+            """,
+            (stage, filename),
+        )
+        old_rows = cur.fetchall() or []
+        for (old_oid,) in old_rows:
+            try:
+                cur.execute("SELECT lo_unlink(%s)", (int(old_oid),))
+            except Exception:
+                pass
+        if old_rows:
+            cur.execute(
+                """
+                DELETE FROM raster_objects
+                WHERE stage = %s AND filename = %s
+                """,
+                (stage, filename),
+            )
+
+        lo = conn.lobject(0, "w")
+        try:
+            with open(file_path_p, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    lo.write(chunk)
+            oid = lo.oid
+        finally:
+            try:
+                lo.close()
+            except Exception:
+                pass
+
+        cur.execute(
+            """
+            INSERT INTO raster_objects (stage, filename, run_id, sha256, size_bytes, content_type, lo_oid)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (stage, filename, sha256) DO NOTHING
+            """,
+            (stage, filename, run_id, digest, size, content_type, oid),
+        )
+        conn.commit()
+
+
+def _store_combined_cog(year: int):
+    ctx = get_current_context()
+    force = ctx.get("dag_run").conf.get("force", False) if ctx.get("dag_run") else False
+    ti = ctx.get("ti")
+    run_id = ti.run_id if ti else "unknown"
+
+    out_tif = OUTPUT_ROOT / f"combined_pop_{year}_cog.tif"
+    if not out_tif.exists():
+        raise FileNotFoundError(f"Combined COG missing: {out_tif}")
+
+    _ensure_db_objects_exist()
+    if not force and _cog_exists_in_db(out_tif.name):
+        print(f"Combined COG already in DB (use dag_run.conf.force=true to overwrite): {out_tif.name}")
+        return
+
+    _store_file_as_large_object("cog", str(out_tif), run_id)
 
 
 def _combine_year(year: int):
@@ -146,8 +272,16 @@ with DAG(
     tags=["raster", "combine", "mosaic"],
 ) as dag:
     for year in YEARS:
-        PythonOperator(
+        combine = PythonOperator(
             task_id=f"combine_{year}",
             python_callable=_combine_year,
             op_kwargs={"year": year},
         )
+
+        store = PythonOperator(
+            task_id=f"store_{year}",
+            python_callable=_store_combined_cog,
+            op_kwargs={"year": year},
+        )
+
+        combine >> store
