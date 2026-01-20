@@ -90,30 +90,41 @@ def _combine_year(year: int):
     # Note: gdalbuildvrt handles differing extents/resolutions better than a naive merge.
     import subprocess
 
+    def _run(cmd: List[str]):
+        print("Running:", " ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True, text=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            if e.stdout:
+                print("STDOUT:\n", e.stdout)
+            if e.stderr:
+                print("STDERR:\n", e.stderr)
+            raise
+
     if vrt.exists():
         vrt.unlink()
 
     buildvrt_cmd = ["gdalbuildvrt", "-overwrite", str(vrt), *inputs]
-    print("Running:", " ".join(buildvrt_cmd))
-    subprocess.run(buildvrt_cmd, check=True)
+    _run(buildvrt_cmd)
 
     translate_cmd = [
         "gdal_translate",
         "-of",
         "COG",
         "-co",
-        "BIGTIFF=IF_NEEDED",
+        "BIGTIFF=YES",
+        "-co",
+        "NUM_THREADS=ALL_CPUS",
         "-co",
         "COMPRESS=LZW",
         str(vrt),
         str(out_tif),
     ]
-    print("Running:", " ".join(translate_cmd))
-    subprocess.run(translate_cmd, check=True)
+    _run(translate_cmd)
 
     # Basic validation
     info_cmd = ["gdalinfo", str(out_tif)]
-    subprocess.run(info_cmd, check=True, stdout=subprocess.DEVNULL)
+    _run(info_cmd)
 
     try:
         vrt.unlink()
