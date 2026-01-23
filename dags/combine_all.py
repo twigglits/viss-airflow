@@ -5,6 +5,9 @@ from typing import List
 import hashlib
 import mimetypes
 
+import numpy as np
+import rasterio
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator, get_current_context
 from airflow.providers.postgres.hooks.postgres import PostgresHook
@@ -112,6 +115,35 @@ def _cog_exists_in_db(filename: str) -> bool:
         return cur.fetchone() is not None
 
 
+def _cog_exact_total_exists(filename: str) -> bool:
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM raster_objects
+            WHERE stage = 'cog' AND filename = %s AND exact_total IS NOT NULL
+            LIMIT 1
+            """,
+            (filename,),
+        )
+        return cur.fetchone() is not None
+
+
+def _set_cog_exact_total(filename: str, total: float):
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE raster_objects
+            SET exact_total = %s
+            WHERE stage = 'cog' AND filename = %s
+            """,
+            (float(total), filename),
+        )
+        conn.commit()
+
+
 def _store_file_as_large_object(stage: str, file_path: str, run_id: str):
     hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
     file_path_p = Path(file_path)
@@ -179,15 +211,65 @@ def _store_combined_cog(year: int):
     run_id = ti.run_id if ti else "unknown"
 
     out_tif = OUTPUT_ROOT / f"combined_pop_{year}_cog.tif"
+    _ensure_db_objects_exist()
+
+    filename = out_tif.name
+    if not force and _cog_exists_in_db(filename):
+        print(f"Combined COG already in DB (use dag_run.conf.force=true to overwrite): {filename}")
+        return
+
+    if not out_tif.exists():
+        raise FileNotFoundError(f"Combined COG missing: {out_tif}")
+
+    _store_file_as_large_object("cog", str(out_tif), run_id)
+
+
+def _rio_calc_combined_cog_exact_total(year: int, nodata: float = -99999.0, bidx: int = 1):
+    ctx = get_current_context()
+    force = ctx.get("dag_run").conf.get("force", False) if ctx.get("dag_run") else False
+
+    out_tif = OUTPUT_ROOT / f"combined_pop_{year}_cog.tif"
     if not out_tif.exists():
         raise FileNotFoundError(f"Combined COG missing: {out_tif}")
 
     _ensure_db_objects_exist()
-    if not force and _cog_exists_in_db(out_tif.name):
-        print(f"Combined COG already in DB (use dag_run.conf.force=true to overwrite): {out_tif.name}")
+
+    filename = out_tif.name
+    if not force and _cog_exact_total_exists(filename):
+        print(f"rio-calc: exact_total already present for cog:{filename}; skipping")
         return
 
-    _store_file_as_large_object("cog", str(out_tif), run_id)
+    print(f"rio-calc: computing exact_total for cog:{filename} from {out_tif}")
+    total = 0.0
+    valid_count = 0
+
+    with rasterio.Env(GDAL_CACHEMAX=512):
+        with rasterio.open(out_tif) as src:
+            if bidx < 1 or bidx > src.count:
+                raise ValueError(f"rio-calc: invalid bidx {bidx}; raster has {src.count} band(s)")
+
+            nd = float(nodata) if nodata is not None else src.nodata
+            for _, window in src.block_windows(bidx):
+                arr = src.read(bidx, window=window, masked=False)
+                if nd is not None:
+                    mask = arr == nd
+                    if mask.any():
+                        arr = np.where(mask, 0.0, arr)
+                        valid_count += int((~mask).sum())
+                    else:
+                        valid_count += int(arr.size)
+                else:
+                    mask = src.dataset_mask(window=window) == 0
+                    if mask.any():
+                        arr = np.where(mask, 0.0, arr)
+                        valid_count += int((~mask).sum())
+                    else:
+                        valid_count += int(arr.size)
+                total += float(arr.sum(dtype=np.float64))
+
+    print(f"rio-calc: computed exact_total={total} valid_count={valid_count} for cog:{filename}")
+    _set_cog_exact_total(filename, float(total))
+    print(f"rio-calc: stored exact_total for cog:{filename}")
 
 
 def _combine_year(year: int):
@@ -284,4 +366,10 @@ with DAG(
             op_kwargs={"year": year},
         )
 
-        combine >> store
+        rio_calc = PythonOperator(
+            task_id=f"rio_calc_{year}",
+            python_callable=_rio_calc_combined_cog_exact_total,
+            op_kwargs={"year": year},
+        )
+
+        combine >> store >> rio_calc
