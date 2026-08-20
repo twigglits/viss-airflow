@@ -122,7 +122,7 @@ if _ENV_COUNTRIES:
 
 # Year range
 YEAR_START = int(os.environ.get("WHO_GHO_YEAR_START", "2000"))
-YEAR_END = int(os.environ.get("WHO_GHO_YEAR_END", "2025"))
+YEAR_END = int(os.environ.get("WHO_GHO_YEAR_END", "2026"))
 
 # Indicators to ingest -- (code, human-readable name)
 INDICATORS: List[Tuple[str, str]] = [

@@ -17,7 +17,7 @@ from airflow.operators.bash import BashOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 # Years to ingest (inclusive)
-YEARS: List[int] = list(range(2015, 2026))
+YEARS: List[int] = list(range(2015, 2027))
 
 # Full ISO 3166-1 alpha-3 list (static)
 ISO3_CODES: List[str] = [
@@ -463,7 +463,9 @@ for CC3 in ISO3_CODES:
                     "--config VSI_CACHE_SIZE {vsi_cache_size_bytes} "
                     "--config GDAL_DISABLE_READDIR_ON_OPEN YES "
                     "-srcnodata -99999 -dstnodata -99999 "
-                    "-co BIGTIFF=YES -co COMPRESS=LZW "
+                    # GTiff driver spells the level ZSTD_LEVEL (the COG driver
+                    # spells it LEVEL) -- passing the wrong one is silently ignored.
+                    "-co BIGTIFF=YES -co COMPRESS=ZSTD -co ZSTD_LEVEL=9 "
                     "{raw} {wm}"
                 ).format(
                     raw=raw_path,

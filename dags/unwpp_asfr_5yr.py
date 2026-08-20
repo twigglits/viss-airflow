@@ -52,7 +52,7 @@ else:
     if _ISO3_ENV:
         ISO3_CODES = [_ISO3_ENV]
 YEAR_START = int(os.environ.get("ASFR_YEAR_START", "2015"))
-YEAR_END = int(os.environ.get("ASFR_YEAR_END", "2025"))
+YEAR_END = int(os.environ.get("ASFR_YEAR_END", "2026"))
 YEARS: List[int] = list(range(YEAR_START, YEAR_END + 1))
 
 UN_BASE = os.environ.get("UN_DP_BASE", "https://population.un.org/dataportalapi").rstrip("/")

@@ -125,7 +125,7 @@ if _ENV_COUNTRIES:
     ISO3_CODES = [c for c in ISO3_CODES if c in _WANT]
 
 YEAR_START = int(os.environ.get("WORLDBANK_YEAR_START", "2000"))
-YEAR_END = int(os.environ.get("WORLDBANK_YEAR_END", "2025"))
+YEAR_END = int(os.environ.get("WORLDBANK_YEAR_END", "2026"))
 
 # (indicator_code, human-readable name)
 INDICATORS: List[Tuple[str, str]] = [

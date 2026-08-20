@@ -15,7 +15,7 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 # Years to process (inclusive)
 YEAR_START = int(os.environ.get("COMBINE_YEAR_START", "2015"))
-YEAR_END = int(os.environ.get("COMBINE_YEAR_END", "2025"))
+YEAR_END = int(os.environ.get("COMBINE_YEAR_END", "2026"))
 YEARS: List[int] = list(range(YEAR_START, YEAR_END + 1))
 
 # Where to look for country folders/files. Defaults to the same data dir used by other DAGs.
@@ -323,8 +323,13 @@ def _combine_year(year: int):
         "BIGTIFF=YES",
         "-co",
         "NUM_THREADS=ALL_CPUS",
+        # ZSTD beats LZW by ~25% on this Float32 mosaic at comparable speed; a
+        # PREDICTOR only hurts here (the data is long runs of NoData and 0.0).
+        # Measured -- see dags/recompress_zstd.py for the full codec table.
         "-co",
-        "COMPRESS=LZW",
+        "COMPRESS=ZSTD",
+        "-co",
+        "LEVEL=9",
         str(vrt),
         str(out_tif),
     ]

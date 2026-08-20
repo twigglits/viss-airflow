@@ -13,6 +13,8 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator, get_current_context
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
+from recompress_zstd import recompress
+
 
 # Output/storage root inside containers (mounted in docker-compose)
 DATA_ROOT = Path(os.environ.get("AIRFLOW_DATA_DIR", "/opt/airflow/data"))
@@ -59,7 +61,7 @@ else:
     if _ISO3_ENV:
         ISO3_CODES = [_ISO3_ENV]
 YEAR_START = int(os.environ.get("AGEPYR_YEAR_START", "2015"))
-YEAR_END = int(os.environ.get("AGEPYR_YEAR_END", "2025"))
+YEAR_END = int(os.environ.get("AGEPYR_YEAR_END", "2026"))
 YEARS: List[int] = list(range(YEAR_START, YEAR_END + 1))
 
 WRITE_CSV_DEFAULT = os.environ.get("AGEPYR_WRITE_CSV", "false").strip().lower() in {"1", "true", "yes", "y"}
@@ -223,6 +225,16 @@ def build_age_pyramid_year(iso3: str, year: int):
             _download(url, dest)
         except Exception as e:
             raise RuntimeError(f"Failed to download age structure file: {url} -> {e}")
+
+        # WorldPop ships these as LZW + PREDICTOR=2, and predictor 2 is an integer
+        # predictor -- on Float32 it actively costs space. Plain ZSTD is ~40%
+        # smaller and bit-exact. No-op for files already converted, so re-running
+        # this DAG also backfills whatever is already on disk.
+        status, before, after = recompress(dest)
+        if status in ("CORRUPT", "FAILED"):
+            print(f"WARNING: recompress {status} for {dest.name}, left as-is")
+        elif status == "ok":
+            print(f"Recompressed {dest.name}: {before} -> {after} bytes")
 
         total = _rio_sum_tif(dest)
         age_totals[code] = float(total)
