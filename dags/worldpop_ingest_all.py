@@ -17,8 +17,13 @@ from airflow.operators.bash import BashOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 # Per-task ceiling. Without one, a wedged task holds an executor slot
 # forever -- and at core.parallelism=2 that is half the install.
-# gdalwarp/gdal_translate on 100m national rasters.
-TASK_TIMEOUT = timedelta(minutes=int(os.environ.get("WORLDPOP_TASK_TIMEOUT_MIN", "180")))
+#
+# 180m was too tight: RUS and USA warps were killed at exactly 3h on the first
+# run under this setting. Their reprojected outputs are 1.2 GB and 2.7 GB
+# (RUS is 416797 x 123684 px), so hours of real work is normal, not a hang.
+# 8h clears the two largest countries with headroom; every other country
+# finishes in minutes, so the ceiling only ever bites on a genuine wedge.
+TASK_TIMEOUT = timedelta(minutes=int(os.environ.get("WORLDPOP_TASK_TIMEOUT_MIN", "480")))
 
 # Years to ingest (inclusive)
 YEARS: List[int] = list(range(2015, 2027))
@@ -149,6 +154,16 @@ def _ensure_db_objects_exist():
             """
         )
         conn.commit()
+
+
+def _usable(path: str) -> bool:
+    """True when the file exists and holds bytes.
+
+    A task killed mid-write (timeout, OOM, container restart) leaves a 0-byte
+    file. Plain exists() treats that as done and the pipeline never recovers.
+    """
+    p = Path(path)
+    return p.exists() and p.stat().st_size > 0
 
 
 def _raw_exact_total_exists(filename: str) -> bool:
@@ -419,8 +434,8 @@ for CC3 in ISO3_CODES:
                 raw_name = Path(expected_raw).name
                 cog_name = Path(expected_cog).name
 
-                if not Path(expected_raw).exists():
-                    print(f"Local RAW missing for {cc3u} {y}: {expected_raw} -> start at download_raw")
+                if not _usable(expected_raw):
+                    print(f"Local RAW missing or empty for {cc3u} {y}: {expected_raw} -> start at download_raw")
                     return f"download_raw_{y}"
 
                 if not _raw_exists_in_db(raw_name):
@@ -431,8 +446,12 @@ for CC3 in ISO3_CODES:
                     print(f"rio-calc exact_total missing for {cc3u} {y}: raw:{raw_name} -> start at rio_calc")
                     return f"rio_calc_{y}"
 
-                if not Path(expected_wm).exists():
-                    print(f"Local WM missing for {cc3u} {y}: {expected_wm} -> start at warp_web_mercator")
+                # exists() is not enough: a gdalwarp killed mid-write leaves a
+                # 0-byte file behind, and trusting it here skips the warp that
+                # would rebuild it, so to_cog fails on an empty input -- forever.
+                # Size is the cheap proxy for "this file is real".
+                if not _usable(expected_wm):
+                    print(f"Local WM missing or empty for {cc3u} {y}: {expected_wm} -> start at warp_web_mercator")
                     return f"warp_web_mercator_{y}"
 
                 exists = _cog_exists_in_db(cog_name)
