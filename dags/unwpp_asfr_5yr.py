@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import time
 import re
@@ -11,6 +11,10 @@ import requests
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+# Per-task ceiling. Without one, a wedged task holds an executor slot
+# forever -- and at core.parallelism=2 that is half the install.
+# UN WPP API, one country.
+TASK_TIMEOUT = timedelta(minutes=int(os.environ.get("ASFR_TASK_TIMEOUT_MIN", "60")))
 
 
 PG_CONN_ID = "viss_data_db"
@@ -437,7 +441,7 @@ for CC3 in ISO3_CODES:
         schedule=None,
         catchup=False,
         max_active_runs=1,
-        default_args={"owner": "airflow", "retries": 2},
+        default_args={"owner": "airflow", "retries": 2, "execution_timeout": TASK_TIMEOUT},
         tags=["un", "wpp", "asfr", "demography", cc3u],
     ) as dag:
         PythonOperator(

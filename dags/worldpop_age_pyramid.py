@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import os
 from typing import Dict, List, Tuple
@@ -14,6 +14,10 @@ from airflow.operators.python import PythonOperator, get_current_context
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 from recompress_zstd import recompress
+# Per-task ceiling. Without one, a wedged task holds an executor slot
+# forever -- and at core.parallelism=2 that is half the install.
+# per-country age-sex raster stack.
+TASK_TIMEOUT = timedelta(minutes=int(os.environ.get("AGEPYR_TASK_TIMEOUT_MIN", "120")))
 
 
 # Output/storage root inside containers (mounted in docker-compose)
@@ -265,7 +269,7 @@ for CC3 in ISO3_CODES:
         schedule=None,
         catchup=False,
         max_active_runs=1,
-        default_args={"owner": "airflow", "retries": 1},
+        default_args={"owner": "airflow", "retries": 1, "execution_timeout": TASK_TIMEOUT},
         tags=["worldpop", "age_pyramid", "demography", cc3u],
     ) as dag:
         for year in YEARS:

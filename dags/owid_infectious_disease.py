@@ -85,7 +85,12 @@ import csv
 import io
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+
+# Per-task ceiling. Without one, a wedged task holds an executor slot
+# forever -- and at core.parallelism=2 that is half the install.
+# downloads and parses the OWID CSV.
+TASK_TIMEOUT = timedelta(minutes=int(os.environ.get("OWID_TASK_TIMEOUT_MIN", "90")))
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -409,7 +414,7 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     concurrency=1,
-    default_args={"owner": "airflow", "retries": 1},
+    default_args={"owner": "airflow", "retries": 1, "execution_timeout": TASK_TIMEOUT},
     tags=["owid", "covid", "surveillance", "vaccination", "epidemiology"],
 ) as dag:
 

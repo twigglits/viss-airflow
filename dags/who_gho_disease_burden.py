@@ -57,7 +57,12 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+
+# Per-task ceiling. Without one, a wedged task holds an executor slot
+# forever -- and at core.parallelism=2 that is half the install.
+# WHO GHO OData, many indicators.
+TASK_TIMEOUT = timedelta(minutes=int(os.environ.get("WHO_GHO_TASK_TIMEOUT_MIN", "60")))
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -322,7 +327,7 @@ for _CC3 in ISO3_CODES:
         schedule=None,
         catchup=False,
         max_active_runs=1,
-        default_args={"owner": "airflow", "retries": 2},
+        default_args={"owner": "airflow", "retries": 2, "execution_timeout": TASK_TIMEOUT},
         tags=["who", "gho", "disease_burden", "hiv", "epidemiology", _cc3u],
     ) as dag:
         PythonOperator(

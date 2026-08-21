@@ -40,6 +40,10 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     max_active_tasks=1,
+    # Deliberately no execution_timeout. Every task here is a deferred wait on a
+    # child DAG, and the queue as a whole is expected to run for days at
+    # core.parallelism=2. A ceiling on these would kill the queue, not a hang.
+    # The child DAGs carry their own per-task timeouts.
     default_args={"owner": "airflow", "retries": 0},
     tags=["worldpop", "orchestrator"],
 ) as dag:

@@ -44,6 +44,11 @@ import io
 import os
 import time
 from datetime import datetime, timedelta, timezone
+
+# Per-task ceiling. Without one, a wedged task holds an executor slot
+# forever -- and at core.parallelism=2 that is half the install.
+# many airports, with rate-limit backoff.
+TASK_TIMEOUT = timedelta(minutes=int(os.environ.get("OPENSKY_TASK_TIMEOUT_MIN", "90")))
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -68,6 +73,13 @@ OPENSKY_PASS = os.environ.get("OPENSKY_PASSWORD", "")
 
 REQUEST_DELAY = float(os.environ.get("OPENSKY_REQUEST_DELAY", "1.0"))
 REQUEST_TIMEOUT = float(os.environ.get("OPENSKY_REQUEST_TIMEOUT", "60"))
+# Rate-limit handling. OpenSky's free tier 429s readily at 243-country scale.
+RATE_LIMIT_RETRIES = int(os.environ.get("OPENSKY_RATE_LIMIT_RETRIES", "4"))
+RATE_LIMIT_BACKOFF = float(os.environ.get("OPENSKY_RATE_LIMIT_BACKOFF", "30"))
+RATE_LIMIT_MAX_SLEEP = float(os.environ.get("OPENSKY_RATE_LIMIT_MAX_SLEEP", "300"))
+# An ingest that could not reach this share of a country's airports is not a
+# result -- it is a gap, and it fails rather than writing a partial day.
+MAX_UNREACHABLE_FRACTION = float(os.environ.get("OPENSKY_MAX_UNREACHABLE_FRACTION", "0.2"))
 
 # IATA 2023 global average load factor
 LOAD_FACTOR = float(os.environ.get("OPENSKY_LOAD_FACTOR", "0.82"))
@@ -288,26 +300,60 @@ def _opensky_auth():
     return None
 
 
+class OpenSkyUnavailable(RuntimeError):
+    """OpenSky could not answer. Distinct from OpenSky answering 'no flights'."""
+
+
 def _fetch_flights(endpoint: str, icao_airport: str, begin: int, end: int) -> List[Dict]:
-    """Fetch arrivals or departures for one airport in a time window."""
+    """Fetch arrivals or departures for one airport in a time window.
+
+    Returns [] ONLY when OpenSky positively reports no flights (HTTP 404 is how
+    it says that). Every other failure raises, because a rate-limited fetch that
+    returns [] is indistinguishable from a quiet airport -- and that zero flows
+    straight into the importation-risk model as if it were an observation.
+    """
     url = f"{OPENSKY_BASE}/flights/{endpoint}"
     params = {"airport": icao_airport, "begin": begin, "end": end}
     auth = _opensky_auth()
 
-    try:
-        resp = requests.get(url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 404:
-            return []
-        if resp.status_code == 429:
-            print(f"OpenSky rate limited for {icao_airport}, skipping")
-            return []
-        if resp.status_code != 200:
-            print(f"OpenSky {resp.status_code} for {endpoint} {icao_airport}")
-            return []
-        return resp.json() or []
-    except requests.exceptions.RequestException as e:
-        print(f"OpenSky request error for {icao_airport}: {e}")
-        return []
+    last_error = "unknown"
+    for attempt in range(1, RATE_LIMIT_RETRIES + 1):
+        try:
+            resp = requests.get(url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.RequestException as e:
+            last_error = f"request error: {e}"
+        else:
+            if resp.status_code == 404:
+                # OpenSky's way of saying "nothing in this window".
+                return []
+            if resp.status_code == 200:
+                return resp.json() or []
+            if resp.status_code == 429:
+                # Honour Retry-After when the server sends it; otherwise back off.
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after) if retry_after else RATE_LIMIT_BACKOFF * attempt
+                except ValueError:
+                    delay = RATE_LIMIT_BACKOFF * attempt
+                delay = min(delay, RATE_LIMIT_MAX_SLEEP)
+                last_error = f"HTTP 429 (rate limited), waited {delay:.0f}s"
+                if attempt < RATE_LIMIT_RETRIES:
+                    print(
+                        f"OpenSky rate limited for {icao_airport} "
+                        f"(attempt {attempt}/{RATE_LIMIT_RETRIES}); sleeping {delay:.0f}s"
+                    )
+                    time.sleep(delay)
+                    continue
+            else:
+                last_error = f"HTTP {resp.status_code}"
+
+        if attempt < RATE_LIMIT_RETRIES:
+            time.sleep(RATE_LIMIT_BACKOFF * attempt)
+
+    raise OpenSkyUnavailable(
+        f"OpenSky {endpoint} failed for {icao_airport} after "
+        f"{RATE_LIMIT_RETRIES} attempts: {last_error}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -354,8 +400,18 @@ def ingest_flight_volumes_for_country(iso3: str):
     # Aggregate: origin_country → (flight_count, estimated_passengers)
     pair_data: Dict[str, Dict[str, int]] = {}  # origin_iso3 → {flights, pax}
 
+    unreachable: List[str] = []
+
     for icao in airports:
-        arrivals = _fetch_flights("arrival", icao, begin_ts, end_ts)
+        try:
+            arrivals = _fetch_flights("arrival", icao, begin_ts, end_ts)
+        except OpenSkyUnavailable as e:
+            # One unreachable airport is tolerable; a country's worth is not.
+            # Tallied here and judged against MAX_UNREACHABLE_FRACTION below.
+            print(f"OpenSky: {e}")
+            unreachable.append(icao)
+            time.sleep(REQUEST_DELAY)
+            continue
         time.sleep(REQUEST_DELAY)
 
         for flight in arrivals:
@@ -385,6 +441,24 @@ def ingest_flight_volumes_for_country(iso3: str):
                 pair_data[origin_iso3] = {"flights": 0, "pax": 0}
             pair_data[origin_iso3]["flights"] += 1
             pair_data[origin_iso3]["pax"] += estimated_pax
+
+    # Coverage gate, before anything is written. A partial day looks exactly
+    # like a quiet day once it is in the table, and downstream it becomes an
+    # importation-risk number nobody can tell apart from an observation.
+    if unreachable:
+        share = len(unreachable) / len(airports)
+        detail = (
+            f"{len(unreachable)}/{len(airports)} airports unreachable for {iso3} "
+            f"on {date_str} ({share:.0%}): {', '.join(sorted(unreachable)[:10])}"
+            + (" ..." if len(unreachable) > 10 else "")
+        )
+        if share > MAX_UNREACHABLE_FRACTION:
+            raise OpenSkyUnavailable(
+                f"Refusing to write a partial day. {detail}. "
+                f"Threshold is {MAX_UNREACHABLE_FRACTION:.0%} "
+                f"(OPENSKY_MAX_UNREACHABLE_FRACTION)."
+            )
+        print(f"WARNING: writing with incomplete coverage. {detail}")
 
     # Upsert country-pair volumes
     with hook.get_conn() as conn, conn.cursor() as cur:
@@ -463,7 +537,7 @@ with DAG(
     schedule=None,
     catchup=False,
     max_active_runs=1,
-    default_args={"owner": "airflow", "retries": 1},
+    default_args={"owner": "airflow", "retries": 1, "execution_timeout": TASK_TIMEOUT},
     tags=["opensky", "reference", "airports", "aircraft", "epidemiology"],
 ) as ref_dag:
     t_airports = PythonOperator(
@@ -494,7 +568,7 @@ for _CC3 in ISO3_CODES:
         schedule=None,
         catchup=False,
         max_active_runs=1,
-        default_args={"owner": "airflow", "retries": 2},
+        default_args={"owner": "airflow", "retries": 2, "execution_timeout": TASK_TIMEOUT},
         tags=["opensky", "flights", "passengers", "mobility", "epidemiology", _cc3u],
     ) as dag:
         PythonOperator(

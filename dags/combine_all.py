@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import os
 from typing import List
@@ -11,6 +11,10 @@ import rasterio
 from airflow import DAG
 from airflow.operators.python import PythonOperator, get_current_context
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+# Per-task ceiling. Without one, a wedged task holds an executor slot
+# forever -- and at core.parallelism=2 that is half the install.
+# mosaics every country COG for one year.
+TASK_TIMEOUT = timedelta(minutes=int(os.environ.get("COMBINE_TASK_TIMEOUT_MIN", "480")))
 
 
 # Years to process (inclusive)
@@ -167,12 +171,28 @@ def _store_file_as_large_object(stage: str, file_path: str, run_id: str):
             (stage, filename),
         )
         old_rows = cur.fetchall() or []
-        for (old_oid,) in old_rows:
-            try:
-                cur.execute("SELECT lo_unlink(%s)", (int(old_oid),))
-            except Exception:
-                pass
         if old_rows:
+            # Unlink old large objects before dropping the rows that reference
+            # them. Two traps here, both previously live:
+            #   1. Swallowing a failed lo_unlink and deleting the row anyway
+            #      orphans the LO -- nothing references it and only vacuumlo
+            #      can reclaim it. That is how a raster DB grows to a terabyte.
+            #   2. A raised error inside psycopg2 aborts the whole transaction,
+            #      so `except: pass` could not work as intended anyway -- every
+            #      later statement in this block would fail.
+            # So: ask which OIDs still exist, unlink exactly those, and let a
+            # genuine failure abort the task instead of leaking silently.
+            old_oids = [int(r[0]) for r in old_rows]
+            cur.execute(
+                "SELECT oid FROM pg_largeobject_metadata WHERE oid = ANY(%s)",
+                (old_oids,),
+            )
+            live_oids = {int(r[0]) for r in cur.fetchall()}
+            for old_oid in old_oids:
+                if old_oid in live_oids:
+                    cur.execute("SELECT lo_unlink(%s)", (old_oid,))
+                else:
+                    print(f"lo_unlink: oid {old_oid} already gone; dropping stale row")
             cur.execute(
                 """
                 DELETE FROM raster_objects
@@ -355,7 +375,7 @@ with DAG(
     catchup=False,
     concurrency=1,
     max_active_runs=1,
-    default_args={"owner": "airflow", "retries": 1},
+    default_args={"owner": "airflow", "retries": 1, "execution_timeout": TASK_TIMEOUT},
     tags=["raster", "combine", "mosaic"],
 ) as dag:
     for year in YEARS:
