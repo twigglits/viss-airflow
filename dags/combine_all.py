@@ -27,8 +27,15 @@ INPUT_ROOT = Path(os.environ.get("COMBINE_INPUT_ROOT", os.environ.get("AIRFLOW_D
 OUTPUT_ROOT = Path(os.environ.get("COMBINE_OUTPUT_ROOT", str(INPUT_ROOT)))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-COG_SUFFIXES = ("_cog.tif", "_cog.tiff")
-COG_GLOB = os.environ.get("COMBINE_COG_GLOB", "*_cog.tif*")
+# Mosaic from the Web-Mercator intermediates, not the per-country COGs.
+# worldpop_ingest_all builds a COG with `gdal_translate -of COG {wm} {cog}` and
+# then keeps only the COG -- as a Postgres large object. No `*_cog.tif` for a
+# country survives on disk, so globbing for them finds nothing and the mosaic
+# comes out empty. `_3857.tif` is the exact input that COG was translated from:
+# same pixels, same CRS, only the internal tiling/overviews differ, and
+# gdalbuildvrt does not care about those.
+COG_SUFFIXES = ("_3857.tif", "_3857.tiff")
+COG_GLOB = os.environ.get("COMBINE_COG_GLOB", "*_3857.tif*")
 
 # Connection used by DAGs to store raster objects in Postgres within this stack.
 # docker-compose.yml provides AIRFLOW_CONN_VISS_DATA_DB, which maps to conn_id: viss_data_db
