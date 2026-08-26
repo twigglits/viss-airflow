@@ -14,7 +14,11 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 # Per-task ceiling. Without one, a wedged task holds an executor slot
 # forever -- and at core.parallelism=2 that is half the install.
 # mosaics every country COG for one year.
-TASK_TIMEOUT = timedelta(minutes=int(os.environ.get("COMBINE_TASK_TIMEOUT_MIN", "480")))
+#
+# 720, not 480: combine_2026 took 7h58m35s on 2026-08-25 and cleared the old
+# 8-hour ceiling by 85 seconds. That is not headroom, it is a coin toss, and
+# the task it would kill is the eight-hour one whose work is hardest to redo.
+TASK_TIMEOUT = timedelta(minutes=int(os.environ.get("COMBINE_TASK_TIMEOUT_MIN", "720")))
 
 
 # Years to process (inclusive)
