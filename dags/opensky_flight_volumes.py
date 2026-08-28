@@ -842,4 +842,10 @@ with DAG(
     PythonOperator(
         task_id="ingest_flight_slice",
         python_callable=ingest_flight_slice,
+        # Every task in the install sits at the default weight of 1, so the tie
+        # breaks on execution date and this DAG -- one slot, once a day -- ends
+        # up behind whatever backlog the worldpop lanes have queued. Outrank
+        # them: a missed day is a day of the 41-day airport rotation lost, and
+        # the credits it would have spent do not roll over.
+        priority_weight=100,
     )
