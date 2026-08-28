@@ -9,24 +9,41 @@ Data sources
 ------------
 - OpenSky Network REST API: https://opensky-network.org/apidoc/rest.html
   License: Open (CC-BY-SA 4.0 for derived data)
-  Auth: Anonymous (100 credits/day) or registered (4000/day)
+  Auth: OAuth2 client credentials (basic auth retired 2026-03-18)
   Endpoints used:
     /flights/arrival?airport={icao}&begin={ts}&end={ts}
-    /flights/departure?airport={icao}&begin={ts}&end={ts}
+  Arrivals alone are enough: each record carries estDepartureAirport, so one
+  call per destination gives both ends of the country pair. Calling
+  /flights/departure as well would double the credit spend for nothing.
+
+- OpenSky aircraft database (static CSV, no credits):
+  https://opensky-network.org/datasets/metadata/aircraftDatabase.csv
+  Maps icao24 transponder address → ICAO type designator.
 
 - OurAirports (airport metadata): https://ourairports.com/data/
   License: Public domain
   Files: airports.csv
 
+Credit budget
+-------------
+The registered tier grants 4000 credits/day and every /flights call costs 30 —
+independently of how wide a time window it asks for, and including calls that
+come back 404. That is ~133 airport-days per day, against 4874 known airports.
+The budget, not the API, is what decides how much of the world gets sampled.
+
 Passenger estimation
 --------------------
-OpenSky provides flight tracks and aircraft type (ICAO type designator), but
-not passenger counts directly. We estimate passengers per flight as:
-  estimated_pax = aircraft_typical_seats × global_avg_load_factor (0.82 per IATA)
+OpenSky reports icao24 and callsign per flight, never the aircraft type. Seats
+are resolved icao24 → typecode (aircraft_registry) → seats
+(aircraft_seat_capacity), then:
+  estimated_pax = typical_seats × global_avg_load_factor (0.82 per IATA)
+Airframes the registry does not know fall back to DEFAULT_SEATS, and each run
+prints what share of its arrivals that was.
 
 Tables
 ------
   airports                  — Airport metadata (from OurAirports)
+  aircraft_registry         — icao24 transponder address → ICAO type code
   aircraft_seat_capacity    — ICAO type → typical seat count
   flight_passenger_volumes  — Daily country-pair passenger estimates
 
@@ -42,6 +59,7 @@ from __future__ import annotations
 import csv
 import io
 import os
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -67,9 +85,48 @@ OPENSKY_BASE = os.environ.get(
     "OPENSKY_API_BASE", "https://opensky-network.org/api"
 ).rstrip("/")
 
-# Optional credentials for higher rate limits
-OPENSKY_USER = os.environ.get("OPENSKY_USERNAME", "")
-OPENSKY_PASS = os.environ.get("OPENSKY_PASSWORD", "")
+# OAuth2 client credentials. Basic auth was retired 2026-03-18 -- without these
+# every /flights call is anonymous and answers 403.
+OPENSKY_CLIENT_ID = os.environ.get("OPENSKY_CLIENT_ID", "")
+OPENSKY_CLIENT_SECRET = os.environ.get("OPENSKY_CLIENT_SECRET", "")
+OPENSKY_TOKEN_URL = os.environ.get(
+    "OPENSKY_TOKEN_URL",
+    "https://auth.opensky-network.org/auth/realms/opensky-network/"
+    "protocol/openid-connect/token",
+)
+
+# Every /flights request costs 30 credits no matter how wide the window, and the
+# registered tier grants 4000/day -- so a run can touch ~133 airports, full stop.
+# Shorter windows do not buy more airports; they cost the same 30 each.
+CREDITS_PER_FLIGHTS_CALL = 30
+DAILY_AIRPORT_BUDGET = int(os.environ.get("OPENSKY_DAILY_AIRPORT_BUDGET", "120"))
+
+# OpenSky publishes historical /flights roughly two days behind. Asking for
+# yesterday answers 404 for every airport on earth, and 404 is how the API says
+# "no flights" -- so a lookback of 1 does not fail, it quietly writes a world
+# with no air travel in it.
+LOOKBACK_DAYS = max(2, int(os.environ.get("OPENSKY_LOOKBACK_DAYS", "2")))
+
+# Which airports the rotation may draw from. Medium airports outnumber large
+# ones three to one and carry very little international traffic, so including
+# them by default would spend most of the budget confirming zeroes.
+CANDIDATE_AIRPORT_TYPES = [
+    t.strip() for t in
+    os.environ.get("OPENSKY_AIRPORT_TYPES", "large_airport").split(",")
+    if t.strip()
+]
+# Optional ISO3 restriction, for testing a slice against a few countries.
+COUNTRY_FILTER = [
+    c.strip().upper() for c in os.environ.get("OPENSKY_COUNTRIES", "").split(",")
+    if c.strip()
+]
+# Consecutive empty fetches before an airport drops behind the rest of the
+# queue, and how long that demotion lasts before it is retried anyway.
+EMPTY_STRIKES_BEFORE_DEMOTION = int(os.environ.get("OPENSKY_EMPTY_STRIKES", "3"))
+DEMOTION_RETRY_DAYS = int(os.environ.get("OPENSKY_DEMOTION_RETRY_DAYS", "30"))
+# Below this many airports a slice is too small for "everything was empty" to
+# mean anything, so the unpublished-day check stays out of the way.
+MIN_AIRPORTS_FOR_EMPTY_CHECK = int(os.environ.get("OPENSKY_MIN_AIRPORTS_FOR_EMPTY_CHECK", "5"))
 
 REQUEST_DELAY = float(os.environ.get("OPENSKY_REQUEST_DELAY", "1.0"))
 REQUEST_TIMEOUT = float(os.environ.get("OPENSKY_REQUEST_TIMEOUT", "60"))
@@ -87,6 +144,12 @@ LOAD_FACTOR = float(os.environ.get("OPENSKY_LOAD_FACTOR", "0.82"))
 OURAIRPORTS_URL = os.environ.get(
     "OURAIRPORTS_CSV_URL",
     "https://davidmegginson.github.io/ourairports-data/airports.csv",
+)
+
+# OpenSky's aircraft database: icao24 -> typecode. Static file, no API credits.
+AIRCRAFT_DB_URL = os.environ.get(
+    "OPENSKY_AIRCRAFT_DB_URL",
+    "https://opensky-network.org/datasets/metadata/aircraftDatabase.csv",
 )
 
 
@@ -147,6 +210,12 @@ def _ensure_tables():
             );
         """)
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS aircraft_registry (
+                icao24   TEXT PRIMARY KEY,
+                typecode TEXT
+            );
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS flight_passenger_volumes (
                 origin_iso3         TEXT NOT NULL,
                 destination_iso3    TEXT NOT NULL,
@@ -158,6 +227,44 @@ def _ensure_tables():
                 PRIMARY KEY (origin_iso3, destination_iso3, date)
             );
         """)
+        # One airport-day is the unit of work, so it is also the unit of
+        # storage. The rotation samples a country's airports across several
+        # days, and rolling straight into flight_passenger_volumes would mean
+        # either overwriting a country's earlier airports or double-counting a
+        # re-run. Writing per airport keeps every fetch idempotent; the
+        # country-pair table is a rollup of this one.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS flight_arrivals_by_airport (
+                dest_icao            TEXT NOT NULL,
+                dest_iso3            TEXT NOT NULL,
+                origin_iso3          TEXT NOT NULL,
+                date                 DATE NOT NULL,
+                flight_count         INTEGER NOT NULL,
+                estimated_passengers INTEGER NOT NULL,
+                fetched_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (dest_icao, origin_iso3, date)
+            );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS flight_arrivals_by_airport_rollup_idx
+                ON flight_arrivals_by_airport (dest_iso3, date)
+        """)
+        # How many of a country's airports the rollup actually saw. Without it
+        # a thinly-sampled country is indistinguishable from a quiet one.
+        cur.execute("""
+            ALTER TABLE flight_passenger_volumes
+                ADD COLUMN IF NOT EXISTS airports_sampled INTEGER
+        """)
+        # Rotation state. consecutive_empty is what makes the queue self-prune:
+        # an airport that keeps reporting no international arrivals earns its
+        # way out of the daily budget instead of being struck off a hand-kept
+        # list.
+        for ddl in (
+            "ALTER TABLE airports ADD COLUMN IF NOT EXISTS last_fetched_at TIMESTAMPTZ",
+            "ALTER TABLE airports ADD COLUMN IF NOT EXISTS consecutive_empty INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE airports ADD COLUMN IF NOT EXISTS last_intl_arrivals INTEGER",
+        ):
+            cur.execute(ddl)
         conn.commit()
 
 
@@ -290,18 +397,104 @@ def seed_aircraft_capacity():
     print(f"Aircraft capacity: seeded {len(AIRCRAFT_SEATS)} type entries")
 
 
+def load_aircraft_registry():
+    """Load OpenSky's aircraft database: transponder address -> ICAO type code.
+
+    /flights records carry icao24 (the transponder hex address) and callsign,
+    never the aircraft type. Without this table there is nothing to look a seat
+    count up by, and every flight silently collapses to DEFAULT_SEATS -- which
+    makes estimated_passengers a constant multiple of flight_count wearing a
+    different name. The registry is a static CSV, so resolving type costs no
+    API credits.
+    """
+    _ensure_tables()
+
+    print(f"Aircraft registry: downloading {AIRCRAFT_DB_URL}")
+    with tempfile.TemporaryDirectory() as workdir:
+        # Straight to disk before parsing. The file is ~90 MB and some model
+        # fields carry embedded newlines, so it has to be read by a real CSV
+        # parser over a seekable file, not line-wise off the socket.
+        raw_path = os.path.join(workdir, "aircraftDatabase.csv")
+        with requests.get(AIRCRAFT_DB_URL, timeout=REQUEST_TIMEOUT, stream=True) as resp:
+            resp.raise_for_status()
+            with open(raw_path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1 << 20):
+                    fh.write(chunk)
+
+        tsv_path = os.path.join(workdir, "registry.tsv")
+        rows = 0
+        with open(raw_path, encoding="utf-8", errors="replace", newline="") as src, \
+                open(tsv_path, "w", encoding="utf-8", newline="") as tmp:
+            for rec in csv.DictReader(src):
+                icao24 = (rec.get("icao24") or "").strip().lower()
+                typecode = (rec.get("typecode") or "").strip().upper()
+                if not icao24 or not typecode:
+                    continue
+                tmp.write(f"{icao24}\t{typecode}\n")
+                rows += 1
+
+        hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+        with hook.get_conn() as conn, conn.cursor() as cur, \
+                open(tsv_path, encoding="utf-8") as tsv:
+            # Rebuild in one transaction: a half-loaded registry would silently
+            # downgrade the aircraft it lost to DEFAULT_SEATS.
+            cur.execute("CREATE TEMP TABLE _ar_stage (icao24 TEXT, typecode TEXT) ON COMMIT DROP")
+            cur.copy_expert("COPY _ar_stage (icao24, typecode) FROM STDIN", tsv)
+            cur.execute("""
+                INSERT INTO aircraft_registry (icao24, typecode)
+                SELECT DISTINCT ON (icao24) icao24, typecode FROM _ar_stage
+                ON CONFLICT (icao24) DO UPDATE SET typecode = EXCLUDED.typecode
+            """)
+            conn.commit()
+
+    print(f"Aircraft registry: loaded {rows} icao24 -> typecode mappings")
+
+
 # ---------------------------------------------------------------------------
 # OpenSky API helpers
 # ---------------------------------------------------------------------------
-def _opensky_auth():
-    """Return (user, pass) tuple or None for anonymous access."""
-    if OPENSKY_USER and OPENSKY_PASS:
-        return (OPENSKY_USER, OPENSKY_PASS)
-    return None
-
-
 class OpenSkyUnavailable(RuntimeError):
     """OpenSky could not answer. Distinct from OpenSky answering 'no flights'."""
+
+
+# Access tokens live 30 minutes. Cache one per worker process and refresh a
+# minute early rather than re-authenticating on every airport.
+_TOKEN_CACHE: Dict[str, Any] = {"token": None, "expires_at": 0.0}
+
+
+def _opensky_token() -> str:
+    """Return a valid OAuth2 access token, fetching or refreshing as needed."""
+    if not (OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET):
+        raise OpenSkyUnavailable(
+            "OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET are unset. OpenSky retired "
+            "basic auth on 2026-03-18; anonymous access cannot read /flights."
+        )
+
+    if _TOKEN_CACHE["token"] and time.time() < _TOKEN_CACHE["expires_at"]:
+        return _TOKEN_CACHE["token"]
+
+    resp = requests.post(
+        OPENSKY_TOKEN_URL,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": OPENSKY_CLIENT_ID,
+            "client_secret": OPENSKY_CLIENT_SECRET,
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    if resp.status_code != 200:
+        raise OpenSkyUnavailable(
+            f"OpenSky token request failed: HTTP {resp.status_code}"
+        )
+
+    payload = resp.json()
+    token = payload.get("access_token")
+    if not token:
+        raise OpenSkyUnavailable("OpenSky token response carried no access_token")
+
+    _TOKEN_CACHE["token"] = token
+    _TOKEN_CACHE["expires_at"] = time.time() + float(payload.get("expires_in", 1800)) - 60
+    return token
 
 
 def _fetch_flights(endpoint: str, icao_airport: str, begin: int, end: int) -> List[Dict]:
@@ -314,12 +507,14 @@ def _fetch_flights(endpoint: str, icao_airport: str, begin: int, end: int) -> Li
     """
     url = f"{OPENSKY_BASE}/flights/{endpoint}"
     params = {"airport": icao_airport, "begin": begin, "end": end}
-    auth = _opensky_auth()
 
     last_error = "unknown"
     for attempt in range(1, RATE_LIMIT_RETRIES + 1):
+        # Fetched per attempt, not once: a task may run for 90 minutes and the
+        # token dies after 30, so a retry must be able to carry a fresh one.
+        headers = {"Authorization": f"Bearer {_opensky_token()}"}
         try:
-            resp = requests.get(url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
         except requests.exceptions.RequestException as e:
             last_error = f"request error: {e}"
         else:
@@ -328,6 +523,13 @@ def _fetch_flights(endpoint: str, icao_airport: str, begin: int, end: int) -> Li
                 return []
             if resp.status_code == 200:
                 return resp.json() or []
+            if resp.status_code == 401:
+                # Token rejected -- drop it so the next attempt re-authenticates.
+                _TOKEN_CACHE["token"] = None
+                _TOKEN_CACHE["expires_at"] = 0.0
+                last_error = "HTTP 401 (token rejected), re-authenticating"
+                if attempt < RATE_LIMIT_RETRIES:
+                    continue
             if resp.status_code == 429:
                 # Honour Retry-After when the server sends it; otherwise back off.
                 retry_after = resp.headers.get("Retry-After")
@@ -359,54 +561,82 @@ def _fetch_flights(endpoint: str, icao_airport: str, begin: int, end: int) -> Li
 # ---------------------------------------------------------------------------
 # Main ingest callable
 # ---------------------------------------------------------------------------
-def ingest_flight_volumes_for_country(iso3: str):
+def _select_airport_slice(cur, budget: int) -> List[tuple]:
+    """Pick this run's airports: least-recently-fetched first, duds last.
+
+    Ordering is two-level. The first key demotes airports that have come back
+    with no international arrivals EMPTY_STRIKES_BEFORE_DEMOTION times running,
+    so the budget drifts towards airports that actually carry traffic without
+    anyone maintaining a list of which those are. The demotion lapses after
+    DEMOTION_RETRY_DAYS -- a seasonal or newly-opened route should not be
+    written off permanently on three quiet days.
     """
-    Fetch yesterday's arrivals at all airports in a country, estimate
-    passenger volumes, and aggregate to country-pair level.
+    cur.execute(
+        """
+        SELECT icao_code, iso3
+        FROM airports
+        WHERE type = ANY(%s)
+          AND (%s::text[] IS NULL OR iso3 = ANY(%s))
+        ORDER BY
+            (consecutive_empty >= %s
+             AND last_fetched_at > NOW() - make_interval(days => %s)) ASC,
+            last_fetched_at ASC NULLS FIRST,
+            icao_code ASC
+        LIMIT %s
+        """,
+        (CANDIDATE_AIRPORT_TYPES, COUNTRY_FILTER or None, COUNTRY_FILTER or None,
+         EMPTY_STRIKES_BEFORE_DEMOTION, DEMOTION_RETRY_DAYS, budget),
+    )
+    return cur.fetchall()
+
+
+def ingest_flight_slice():
+    """Fetch one budget's worth of airports and roll them into country pairs.
+
+    The /flights allowance is 4000 credits a day at 30 credits a call, so a run
+    can touch about 133 airports out of 4874. This is therefore a rotation, not
+    a sweep: each run takes the least-recently-fetched slice, and a given
+    airport comes round every few days. Sampling is by airport rather than by
+    country because the budget is global -- 185 per-country tasks cannot share
+    one ceiling without fighting over it.
     """
-    iso3 = iso3.upper().strip()
     _ensure_tables()
 
+    budget = max(1, DAILY_AIRPORT_BUDGET)
     hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
 
-    # Get airports for this country
     with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT icao_code FROM airports WHERE iso3 = %s", (iso3,))
-        airports = [row[0] for row in cur.fetchall()]
+        slice_rows = _select_airport_slice(cur, budget)
+        cur.execute("SELECT icao_code, iso3 FROM airports")
+        airport_country = {r[0]: r[1] for r in cur.fetchall()}
+        cur.execute("SELECT icao_type_code, typical_seats FROM aircraft_seat_capacity")
+        capacity_map = {r[0]: r[1] for r in cur.fetchall()}
 
-    if not airports:
-        print(f"OpenSky: No airports found for {iso3}, skipping")
+    if not slice_rows:
+        print("OpenSky: no candidate airports in the queue; nothing to do")
         return
 
-    # Time window: yesterday 00:00 UTC to today 00:00 UTC
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday = today - timedelta(days=1)
-    begin_ts = int(yesterday.timestamp())
-    end_ts = int(today.timestamp())
-    date_str = yesterday.strftime("%Y-%m-%d")
+    # Time window: one full UTC day, LOOKBACK_DAYS back (see LOOKBACK_DAYS).
+    midnight = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    target = midnight - timedelta(days=LOOKBACK_DAYS)
+    begin_ts = int(target.timestamp())
+    end_ts = int((target + timedelta(days=1)).timestamp())
+    date_str = target.strftime("%Y-%m-%d")
 
-    print(f"OpenSky: Fetching arrivals for {iso3} ({len(airports)} airports) date={date_str}")
+    print(
+        f"OpenSky: slice of {len(slice_rows)} airports for {date_str} "
+        f"(~{len(slice_rows) * CREDITS_PER_FLIGHTS_CALL} credits of 4000/day)"
+    )
 
-    # Load aircraft capacity lookup
-    with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT icao_type_code, typical_seats FROM aircraft_seat_capacity")
-        capacity_map = {row[0]: row[1] for row in cur.fetchall()}
-
-    # Load airport → country mapping
-    with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT icao_code, iso3 FROM airports")
-        airport_country = {row[0]: row[1] for row in cur.fetchall()}
-
-    # Aggregate: origin_country → (flight_count, estimated_passengers)
-    pair_data: Dict[str, Dict[str, int]] = {}  # origin_iso3 → {flights, pax}
-
+    # icao_code -> [(origin_iso3, icao24), ...] for international arrivals only.
+    per_airport: Dict[str, List[tuple]] = {}
     unreachable: List[str] = []
 
-    for icao in airports:
+    for icao, dest_iso3 in slice_rows:
         try:
             arrivals = _fetch_flights("arrival", icao, begin_ts, end_ts)
         except OpenSkyUnavailable as e:
-            # One unreachable airport is tolerable; a country's worth is not.
+            # One unreachable airport is tolerable; a slice's worth is not.
             # Tallied here and judged against MAX_UNREACHABLE_FRACTION below.
             print(f"OpenSky: {e}")
             unreachable.append(icao)
@@ -414,116 +644,150 @@ def ingest_flight_volumes_for_country(iso3: str):
             continue
         time.sleep(REQUEST_DELAY)
 
+        seen: List[tuple] = []
         for flight in arrivals:
             dep_airport = (flight.get("estDepartureAirport") or "").strip().upper()
             if not dep_airport:
+                # OpenSky could not place the departure -- roughly one arrival in
+                # six. Counting it would need an origin country we do not have.
                 continue
-
             origin_iso3 = airport_country.get(dep_airport)
-            if not origin_iso3 or origin_iso3 == iso3:
+            if not origin_iso3 or origin_iso3 == dest_iso3:
                 # Skip domestic flights and unknown origins
                 continue
+            seen.append((origin_iso3, (flight.get("icao24") or "").strip().lower()))
+        per_airport[icao] = seen
 
-            # Estimate passengers from aircraft type
-            icao_type = (flight.get("icao24") or "").strip().upper()
-            # OpenSky callsign sometimes has aircraft type info, but icao24
-            # is the transponder address — we use callsign prefix heuristic
-            # or default seats since OpenSky doesn't reliably provide type
-            callsign = (flight.get("callsign") or "").strip()
-            seats = DEFAULT_SEATS
+    observed_total = sum(len(v) for v in per_airport.values())
 
-            # Try to match aircraft type from the capacity map
-            # OpenSky doesn't provide ICAO type directly in flight data,
-            # so we use default capacity as baseline estimation
-            estimated_pax = int(seats * LOAD_FACTOR)
+    # Resolve aircraft type -> seats for every airframe in the slice, in one
+    # round trip. Anything the registry does not know falls back to
+    # DEFAULT_SEATS; the share that falls back is printed so a run that is
+    # mostly guesswork says so out loud.
+    seats_by_icao24: Dict[str, int] = {}
+    icao24s = sorted({i for v in per_airport.values() for _, i in v if i})
+    if icao24s:
+        with hook.get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT icao24, typecode FROM aircraft_registry WHERE icao24 = ANY(%s)",
+                (icao24s,),
+            )
+            for icao24, typecode in cur.fetchall():
+                if typecode in capacity_map:
+                    seats_by_icao24[icao24] = capacity_map[typecode]
 
-            if origin_iso3 not in pair_data:
-                pair_data[origin_iso3] = {"flights": 0, "pax": 0}
-            pair_data[origin_iso3]["flights"] += 1
-            pair_data[origin_iso3]["pax"] += estimated_pax
+    # A whole slice of large airports reporting no international arrivals is not
+    # a quiet day -- it is OpenSky answering 404 because it has not published
+    # that date yet, and 404 is also how it says "no flights". Writing it would
+    # put a fabricated zero in front of the model.
+    fetched = len(per_airport)
+    if fetched >= MIN_AIRPORTS_FOR_EMPTY_CHECK and observed_total == 0:
+        raise OpenSkyUnavailable(
+            f"All {fetched} airports in the slice reported zero international "
+            f"arrivals on {date_str}. OpenSky most likely has not published that "
+            f"day yet; raise OPENSKY_LOOKBACK_DAYS (currently {LOOKBACK_DAYS}) "
+            f"rather than recording this as an observation."
+        )
 
-    # Coverage gate, before anything is written. A partial day looks exactly
-    # like a quiet day once it is in the table, and downstream it becomes an
-    # importation-risk number nobody can tell apart from an observation.
+    # Coverage gate, before anything is written. A slice that mostly failed is
+    # not a thin sample, it is an outage, and once written the two look alike.
     if unreachable:
-        share = len(unreachable) / len(airports)
+        share = len(unreachable) / len(slice_rows)
         detail = (
-            f"{len(unreachable)}/{len(airports)} airports unreachable for {iso3} "
-            f"on {date_str} ({share:.0%}): {', '.join(sorted(unreachable)[:10])}"
+            f"{len(unreachable)}/{len(slice_rows)} airports unreachable on "
+            f"{date_str} ({share:.0%}): {', '.join(sorted(unreachable)[:10])}"
             + (" ..." if len(unreachable) > 10 else "")
         )
         if share > MAX_UNREACHABLE_FRACTION:
             raise OpenSkyUnavailable(
-                f"Refusing to write a partial day. {detail}. "
+                f"Refusing to write a partial slice. {detail}. "
                 f"Threshold is {MAX_UNREACHABLE_FRACTION:.0%} "
                 f"(OPENSKY_MAX_UNREACHABLE_FRACTION)."
             )
         print(f"WARNING: writing with incomplete coverage. {detail}")
 
-    # Upsert country-pair volumes
+    dest_iso3_by_icao = {icao: iso3 for icao, iso3 in slice_rows}
+    resolved = 0
+    touched_countries = set()
+
     with hook.get_conn() as conn, conn.cursor() as cur:
-        for origin, data in pair_data.items():
-            cur.execute("""
-                INSERT INTO flight_passenger_volumes
-                    (origin_iso3, destination_iso3, date, flight_count, estimated_passengers, source)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (origin_iso3, destination_iso3, date)
-                DO UPDATE SET
-                    flight_count         = EXCLUDED.flight_count,
-                    estimated_passengers = EXCLUDED.estimated_passengers
-            """, (origin, iso3, date_str, data["flights"], data["pax"], "OPENSKY"))
+        for icao, seen in per_airport.items():
+            dest_iso3 = dest_iso3_by_icao[icao]
+            touched_countries.add(dest_iso3)
+
+            pair_data: Dict[str, Dict[str, int]] = {}
+            for origin_iso3, icao24 in seen:
+                seats = seats_by_icao24.get(icao24)
+                if seats is None:
+                    seats = DEFAULT_SEATS
+                else:
+                    resolved += 1
+                bucket = pair_data.setdefault(origin_iso3, {"flights": 0, "pax": 0})
+                bucket["flights"] += 1
+                bucket["pax"] += int(seats * LOAD_FACTOR)
+
+            # Replace rather than merge: a re-fetch is the authority on what
+            # this airport saw that day, including routes that have gone away.
+            cur.execute(
+                "DELETE FROM flight_arrivals_by_airport WHERE dest_icao = %s AND date = %s",
+                (icao, date_str),
+            )
+            for origin, data in pair_data.items():
+                cur.execute(
+                    """
+                    INSERT INTO flight_arrivals_by_airport
+                        (dest_icao, dest_iso3, origin_iso3, date,
+                         flight_count, estimated_passengers)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (icao, dest_iso3, origin, date_str, data["flights"], data["pax"]),
+                )
+
+            # Rotation state. An empty fetch is a strike; anything at all clears
+            # the count, so one quiet day cannot demote a busy airport.
+            cur.execute(
+                """
+                UPDATE airports SET
+                    last_fetched_at    = NOW(),
+                    last_intl_arrivals = %s,
+                    consecutive_empty  = CASE WHEN %s = 0 THEN consecutive_empty + 1 ELSE 0 END
+                WHERE icao_code = %s
+                """,
+                (len(seen), len(seen), icao),
+            )
+
+        # Recompute the country-pair rollup for every country this slice
+        # touched, from all airport-days on record for that date.
+        cur.execute(
+            """
+            INSERT INTO flight_passenger_volumes
+                (origin_iso3, destination_iso3, date,
+                 flight_count, estimated_passengers, source, airports_sampled)
+            SELECT origin_iso3, dest_iso3, date,
+                   SUM(flight_count), SUM(estimated_passengers),
+                   'OPENSKY', COUNT(DISTINCT dest_icao)
+            FROM flight_arrivals_by_airport
+            WHERE dest_iso3 = ANY(%s) AND date = %s
+            GROUP BY origin_iso3, dest_iso3, date
+            ON CONFLICT (origin_iso3, destination_iso3, date) DO UPDATE SET
+                flight_count         = EXCLUDED.flight_count,
+                estimated_passengers = EXCLUDED.estimated_passengers,
+                airports_sampled     = EXCLUDED.airports_sampled
+            """,
+            (sorted(touched_countries), date_str),
+        )
         conn.commit()
 
-    total_flights = sum(d["flights"] for d in pair_data.values())
-    total_pax = sum(d["pax"] for d in pair_data.values())
+    if observed_total:
+        print(
+            f"OpenSky: {resolved}/{observed_total} arrivals "
+            f"({resolved / observed_total:.0%}) had a known aircraft type; "
+            f"the rest used DEFAULT_SEATS={DEFAULT_SEATS}"
+        )
     print(
-        f"OpenSky: {iso3} date={date_str}: "
-        f"{len(pair_data)} origin countries, "
-        f"{total_flights} international flights, "
-        f"~{total_pax} estimated passengers"
+        f"OpenSky: {date_str}: {fetched} airports fetched across "
+        f"{len(touched_countries)} countries, {observed_total} international arrivals"
     )
-
-
-# ---------------------------------------------------------------------------
-# Country list (same as other VISS DAGs)
-# ---------------------------------------------------------------------------
-_ENV_COUNTRIES = os.environ.get("OPENSKY_COUNTRIES", "").strip()
-
-ISO3_CODES: List[str] = [
-    'ABW','AFG','AGO','ALA','ALB','AND','ARE','ARG','ARM','AUS','AUT','AZE',
-    'BDI','BEL','BEN','BFA','BGD','BGR','BHR','BHS','BIH','BLR','BLZ','BOL',
-    'BRA','BRB','BRN','BTN','BWA',
-    'CAF','CAN','CHE','CHL','CHN','CIV','CMR','COD','COG','COL','COM','CPV',
-    'CRI','CUB','CYP','CZE',
-    'DEU','DJI','DMA','DNK','DOM','DZA',
-    'ECU','EGY','ERI','ESP','EST','ETH',
-    'FIN','FJI','FRA',
-    'GAB','GBR','GEO','GHA','GIN','GMB','GNB','GNQ','GRC','GRD','GTM','GUY',
-    'HND','HRV','HTI','HUN',
-    'IDN','IND','IRL','IRN','IRQ','ISL','ISR','ITA',
-    'JAM','JOR','JPN',
-    'KAZ','KEN','KGZ','KHM','KIR','KOR','KWT',
-    'LAO','LBN','LBR','LBY','LCA','LKA','LSO','LTU','LUX','LVA',
-    'MAR','MDA','MDG','MDV','MEX','MKD','MLI','MLT','MMR','MNE','MNG','MOZ',
-    'MRT','MUS','MWI','MYS',
-    'NAM','NER','NGA','NIC','NLD','NOR','NPL','NZL',
-    'OMN',
-    'PAK','PAN','PER','PHL','PNG','POL','PRT','PRY','PSE',
-    'QAT',
-    'ROU','RUS','RWA',
-    'SAU','SDN','SEN','SGP','SLB','SLE','SLV','SOM','SRB','SSD','STP','SUR',
-    'SVK','SVN','SWE','SWZ','SYC','SYR',
-    'TCD','TGO','THA','TJK','TKM','TLS','TON','TTO','TUN','TUR','TZA',
-    'UGA','UKR','URY','USA','UZB',
-    'VCT','VEN','VNM','VUT',
-    'WSM',
-    'YEM',
-    'ZAF','ZMB','ZWE',
-]
-
-if _ENV_COUNTRIES:
-    _WANT = {c.strip().upper() for c in _ENV_COUNTRIES.split(",") if c.strip()}
-    ISO3_CODES = [c for c in ISO3_CODES if c in _WANT]
 
 
 # ---------------------------------------------------------------------------
@@ -548,31 +812,34 @@ with DAG(
         task_id="seed_aircraft_capacity",
         python_callable=seed_aircraft_capacity,
     )
-    t_airports >> t_aircraft
+    t_registry = PythonOperator(
+        task_id="load_aircraft_registry",
+        python_callable=load_aircraft_registry,
+    )
+    t_airports >> t_aircraft >> t_registry
 
 
 # ---------------------------------------------------------------------------
-# DAG factory: one DAG per country for daily flight volumes
+# DAG 2: Daily flight volume slice
+#
+# One DAG, not one per country. The credit allowance is global -- 4000 a day
+# against 30 a call -- so the thing that has to be rationed is global too. A
+# per-country DAG cannot know what the other 184 have already spent.
 # ---------------------------------------------------------------------------
-for _CC3 in ISO3_CODES:
-    _cc3u = _CC3.upper()
-    _cc3l = _CC3.lower()
-
-    with DAG(
-        dag_id=f"opensky_flights_{_cc3l}",
-        description=(
-            f"Ingest daily international flight arrivals for {_cc3u} "
-            f"from OpenSky Network and estimate passenger volumes"
-        ),
-        start_date=datetime(2025, 1, 1),
-        schedule=None,
-        catchup=False,
-        max_active_runs=1,
-        default_args={"owner": "airflow", "retries": 2, "execution_timeout": TASK_TIMEOUT},
-        tags=["opensky", "flights", "passengers", "mobility", "epidemiology", _cc3u],
-    ) as dag:
-        PythonOperator(
-            task_id=f"ingest_flights_{_cc3l}",
-            python_callable=ingest_flight_volumes_for_country,
-            op_kwargs={"iso3": _cc3u},
-        )
+with DAG(
+    dag_id="opensky_flight_volumes",
+    description=(
+        "Fetch one daily budget of airports from OpenSky and roll international "
+        "arrivals up into country-pair passenger volumes"
+    ),
+    start_date=datetime(2025, 1, 1),
+    schedule="@daily",
+    catchup=False,
+    max_active_runs=1,
+    default_args={"owner": "airflow", "retries": 2, "execution_timeout": TASK_TIMEOUT},
+    tags=["opensky", "flights", "passengers", "mobility", "epidemiology"],
+) as flights_dag:
+    PythonOperator(
+        task_id="ingest_flight_slice",
+        python_callable=ingest_flight_slice,
+    )
