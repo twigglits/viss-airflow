@@ -1,10 +1,21 @@
-"""Run the per-country WorldPop ingest DAGs strictly one at a time.
+"""Run the per-country WorldPop ingest DAGs, WORLDPOP_LANES countries at a time.
 
-Airflow has no "one DAG at a time" setting. `core.parallelism` caps concurrent
-*tasks*, but the scheduler still interleaves those tasks across DAGs, so several
-countries end up half-finished at once. This DAG is the queue: one
-TriggerDagRunOperator per country, chained, each waiting for its child DAG to
-finish before the next one fires.
+Airflow has no "N DAGs at a time" setting. `core.parallelism` caps concurrent
+*tasks* but the scheduler still interleaves them across DAGs, so without a queue
+every country ends up half-finished at once. `max_active_tasks` cannot do the job
+either: these triggers are deferrable, and a deferred task holds no concurrency
+slot, so all 243 would fire together.
+
+So the queue is built out of chains: countries are dealt round-robin into
+WORLDPOP_LANES chains, and each chain runs strictly one country at a time. Lanes
+run independently, so exactly WORLDPOP_LANES countries are in flight. Set
+WORLDPOP_LANES=1 for the old strictly-sequential behaviour.
+
+Sizing a lane: a lane costs one gdalwarp, so the ceiling is host RAM and cores
+divided by WORLDPOP_GDAL_CACHEMAX_MB + WORLDPOP_GDAL_WM_MB and
+WORLDPOP_GDAL_NUM_THREADS respectively. `core.parallelism` must be at least
+2 x WORLDPOP_LANES, since each lane needs a slot for the child task plus a slot
+to resume its own trigger task into.
 
 Trigger this DAG (`worldpop_sequential`); leave the `worldpop_ingest_cog_*` DAGs
 unpaused but never trigger them by hand while this is running.
@@ -32,24 +43,31 @@ if _want:
     keep = {c.strip().upper() for c in _want.split(",") if c.strip()}
     ISO3_CODES = [c for c in ISO3_CODES if c in keep]
 
+LANES = max(1, int(os.getenv("WORLDPOP_LANES", "4")))
+
 with DAG(
     dag_id="worldpop_sequential",
-    description=f"Queue: runs {len(ISO3_CODES)} worldpop_ingest_cog_* DAGs one at a time",
+    description=f"Queue: runs {len(ISO3_CODES)} worldpop_ingest_cog_* DAGs, {LANES} at a time",
     start_date=datetime(2025, 1, 1),
     schedule=None,
     catchup=False,
     max_active_runs=1,
-    max_active_tasks=1,
+    # Backstop only -- the chains are what actually limit concurrency, since
+    # deferred triggers do not count against this.
+    max_active_tasks=LANES,
     # Deliberately no execution_timeout. Every task here is a deferred wait on a
-    # child DAG, and the queue as a whole is expected to run for days at
-    # core.parallelism=2. A ceiling on these would kill the queue, not a hang.
+    # child DAG, and the queue as a whole is expected to run for days.
+    # A ceiling on these would kill the queue, not a hang.
     # The child DAGs carry their own per-task timeouts.
     default_args={"owner": "airflow", "retries": 0},
     tags=["worldpop", "orchestrator"],
 ) as dag:
-    previous = None
-    for _cc3 in ISO3_CODES:
+    # One tail per lane. Countries are dealt round-robin so the two monsters
+    # (RUS, USA) land in different lanes rather than stacking up behind each other.
+    previous = [None] * LANES
+    for _i, _cc3 in enumerate(ISO3_CODES):
         _cc3l = _cc3.lower()
+        _lane = _i % LANES
         step = TriggerDagRunOperator(
             task_id=f"run_{_cc3l}",
             trigger_dag_id=f"worldpop_ingest_cog_{_cc3l}",
@@ -66,6 +84,6 @@ with DAG(
             # remaining queue.
             trigger_rule="all_done",
         )
-        if previous is not None:
-            previous >> step
-        previous = step
+        if previous[_lane] is not None:
+            previous[_lane] >> step
+        previous[_lane] = step

@@ -47,12 +47,17 @@ from pathlib import Path
 
 import rasterio
 
+# ALL_CPUS is right when this script is the only thing running. It is wrong once
+# several country DAGs recompress at once -- each gdal_translate would claim all
+# 16 cores and they would thrash. The Airflow env pins this to a per-task share.
+NUM_THREADS = os.environ.get("RECOMPRESS_NUM_THREADS", "ALL_CPUS")
+
 # ponytail: no config file, no class hierarchy. Two profiles is the whole domain.
 GTIFF_OPTS = [
     "-of", "GTiff",
     "-co", "TILED=YES", "-co", "BLOCKXSIZE=512", "-co", "BLOCKYSIZE=512",
     "-co", "COMPRESS=ZSTD", "-co", "ZSTD_LEVEL=9",
-    "-co", "BIGTIFF=YES", "-co", "NUM_THREADS=ALL_CPUS",
+    "-co", "BIGTIFF=YES", "-co", f"NUM_THREADS={NUM_THREADS}",
 ]
 COG_OPTS = [
     "-of", "COG",
@@ -62,7 +67,7 @@ COG_OPTS = [
     # built the file -- and overviews are exactly what titiler serves at low zoom,
     # so a silent resampling change would alter the rendered map.
     "-co", "OVERVIEWS=FORCE_USE_EXISTING",
-    "-co", "BIGTIFF=YES", "-co", "NUM_THREADS=ALL_CPUS",
+    "-co", "BIGTIFF=YES", "-co", f"NUM_THREADS={NUM_THREADS}",
 ]
 
 

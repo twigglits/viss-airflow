@@ -15,8 +15,10 @@ from airflow.operators.python import BranchPythonOperator, PythonOperator, get_c
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.operators.bash import BashOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-# Per-task ceiling. Without one, a wedged task holds an executor slot
-# forever -- and at core.parallelism=2 that is half the install.
+
+from recompress_zstd import recompress
+# Per-task ceiling. Without one, a wedged task holds an executor slot forever
+# -- and slots are the scarce resource that caps how many countries run at once.
 #
 # 180m was too tight: RUS and USA warps were killed at exactly 3h on the first
 # run under this setting. Their reprojected outputs are 1.2 GB and 2.7 GB
@@ -401,6 +403,41 @@ def _store_lo(stage: str, file_path: str):
 
 
 
+def _recompress(paths: Iterable[str]):
+    """Losslessly re-encode this year's rasters to ZSTD in place.
+
+    WorldPop ships raw as LZW+PREDICTOR=2, and every warp written before the
+    `-co COMPRESS=ZSTD` flag went into warp_web_mercator is plain LZW. Both are
+    25-40% larger than plain ZSTD at bit-identical pixels -- see
+    recompress_zstd.py for the measured codec table. recompress() verifies the
+    rewrite block-by-block (including overviews) and only then replaces the
+    original, so a file that fails verification is reported and left alone.
+
+    A file already in the target state costs one rasterio.open(), so running
+    this every year is cheap and it backfills whatever is already on disk.
+    """
+    checked = before_total = after_total = 0
+    for path in paths:
+        path = Path(path)
+        if not _usable(str(path)):
+            continue
+        status, before, after = recompress(path)
+        checked += 1
+        before_total += before
+        after_total += after
+        if status in ("CORRUPT", "FAILED"):
+            print(f"WARNING: recompress {status} for {path.name}, left as-is")
+        elif status == "ok":
+            print(f"recompressed {path.name}: {before} -> {after} bytes")
+    print(f"recompress: {checked} file(s) checked, {before_total - after_total} bytes saved")
+
+
+def _recompress_country(cc3l: str):
+    """End-of-country sweep. The per-year tasks only know the three paths this
+    DAG builds; the glob also catches leftovers from earlier releases and from
+    years outside the current YEARS range."""
+    _recompress(sorted(DATA_ROOT.glob(f"{cc3l}_pop_*.tif")))
+
 
 # DAG factory
 for CC3 in ISO3_CODES:
@@ -424,6 +461,8 @@ for CC3 in ISO3_CODES:
             task_id="ensure_env",
             python_callable=_ensure_env,
         )
+
+        year_tails = []
 
         for year in YEARS:
             raw_path, wm_path, cog_path = _year_paths(cc3l, year)
@@ -523,10 +562,12 @@ for CC3 in ISO3_CODES:
                     "rm -f {cog}; "
                     "gdal_translate -of COG "
                     "-co COMPRESS=ZSTD "
-                    "-co NUM_THREADS=ALL_CPUS "
+                    # ALL_CPUS is every core in the container, and with several
+                    # lanes running that is one full box each. Same share as warp.
+                    "-co NUM_THREADS={gdal_num_threads} "
                     "-co OVERVIEW_RESAMPLING=AVERAGE "
                     "{wm} {cog}"
-                ).format(wm=wm_path, cog=cog_path),
+                ).format(wm=wm_path, cog=cog_path, gdal_num_threads=GDAL_NUM_THREADS),
                 trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
             )
 
@@ -548,6 +589,17 @@ for CC3 in ISO3_CODES:
                 trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
             )
 
+            # ALL_DONE, not the usual NONE_FAILED_*: this must also run when the
+            # year was skipped outright (nothing new, but old LZW files on disk
+            # still get backfilled) and when the warp or COG step failed (the
+            # raw that did land is still worth shrinking).
+            recompress_year = PythonOperator(
+                task_id=f"recompress_{year}",
+                python_callable=_recompress,
+                op_kwargs={"paths": [raw_path, wm_path, cog_path]},
+                trigger_rule=TriggerRule.ALL_DONE,
+            )
+
             ensure_env >> check_missing
             check_missing >> [skip_year, download_raw, store_raw, rio_calc, warp_web_mercator, to_cog]
 
@@ -556,3 +608,14 @@ for CC3 in ISO3_CODES:
             rio_calc >> warp_web_mercator
             warp_web_mercator >> to_cog
             to_cog >> store_cog >> validate_cog
+
+            [skip_year, validate_cog] >> recompress_year
+            year_tails.append(recompress_year)
+
+        recompress_country = PythonOperator(
+            task_id="recompress_country",
+            python_callable=_recompress_country,
+            op_kwargs={"cc3l": cc3l},
+            trigger_rule=TriggerRule.ALL_DONE,
+        )
+        year_tails >> recompress_country
