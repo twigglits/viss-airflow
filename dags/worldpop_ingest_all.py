@@ -562,10 +562,12 @@ for CC3 in ISO3_CODES:
                     "rm -f {cog}; "
                     "gdal_translate -of COG "
                     "-co COMPRESS=ZSTD "
-                    "-co NUM_THREADS=ALL_CPUS "
+                    # ALL_CPUS is every core in the container, and with several
+                    # lanes running that is one full box each. Same share as warp.
+                    "-co NUM_THREADS={gdal_num_threads} "
                     "-co OVERVIEW_RESAMPLING=AVERAGE "
                     "{wm} {cog}"
-                ).format(wm=wm_path, cog=cog_path),
+                ).format(wm=wm_path, cog=cog_path, gdal_num_threads=GDAL_NUM_THREADS),
                 trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
             )
 
