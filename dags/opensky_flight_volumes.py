@@ -249,6 +249,26 @@ def _ensure_tables():
             CREATE INDEX IF NOT EXISTS flight_arrivals_by_airport_rollup_idx
                 ON flight_arrivals_by_airport (dest_iso3, date)
         """)
+        # The airport pair behind each arrival. flight_arrivals_by_airport keeps
+        # only the origin *country*, which is all the country-pair rollup needs;
+        # a map that draws routes needs both ends of the line. Same fetch, one
+        # more field kept -- the departure ICAO was already being read and thrown
+        # away once it had answered "which country did this come from".
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS flight_routes (
+                origin_icao          TEXT NOT NULL,
+                dest_icao            TEXT NOT NULL,
+                date                 DATE NOT NULL,
+                flight_count         INTEGER NOT NULL,
+                estimated_passengers INTEGER NOT NULL,
+                fetched_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (origin_icao, dest_icao, date)
+            );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS flight_routes_dest_idx
+                ON flight_routes (dest_icao, date)
+        """)
         # How many of a country's airports the rollup actually saw. Without it
         # a thinly-sampled country is indistinguishable from a quiet one.
         cur.execute("""
@@ -655,7 +675,7 @@ def ingest_flight_slice():
             if not origin_iso3 or origin_iso3 == dest_iso3:
                 # Skip domestic flights and unknown origins
                 continue
-            seen.append((origin_iso3, (flight.get("icao24") or "").strip().lower()))
+            seen.append((origin_iso3, (flight.get("icao24") or "").strip().lower(), dep_airport))
         per_airport[icao] = seen
 
     observed_total = sum(len(v) for v in per_airport.values())
@@ -665,7 +685,7 @@ def ingest_flight_slice():
     # DEFAULT_SEATS; the share that falls back is printed so a run that is
     # mostly guesswork says so out loud.
     seats_by_icao24: Dict[str, int] = {}
-    icao24s = sorted({i for v in per_airport.values() for _, i in v if i})
+    icao24s = sorted({i for v in per_airport.values() for _, i, _ in v if i})
     if icao24s:
         with hook.get_conn() as conn, conn.cursor() as cur:
             cur.execute(
@@ -716,15 +736,20 @@ def ingest_flight_slice():
             touched_countries.add(dest_iso3)
 
             pair_data: Dict[str, Dict[str, int]] = {}
-            for origin_iso3, icao24 in seen:
+            route_data: Dict[str, Dict[str, int]] = {}
+            for origin_iso3, icao24, origin_icao in seen:
                 seats = seats_by_icao24.get(icao24)
                 if seats is None:
                     seats = DEFAULT_SEATS
                 else:
                     resolved += 1
+                pax = int(seats * LOAD_FACTOR)
                 bucket = pair_data.setdefault(origin_iso3, {"flights": 0, "pax": 0})
                 bucket["flights"] += 1
-                bucket["pax"] += int(seats * LOAD_FACTOR)
+                bucket["pax"] += pax
+                route = route_data.setdefault(origin_icao, {"flights": 0, "pax": 0})
+                route["flights"] += 1
+                route["pax"] += pax
 
             # Replace rather than merge: a re-fetch is the authority on what
             # this airport saw that day, including routes that have gone away.
@@ -741,6 +766,23 @@ def ingest_flight_slice():
                     VALUES (%s, %s, %s, %s, %s, %s)
                     """,
                     (icao, dest_iso3, origin, date_str, data["flights"], data["pax"]),
+                )
+
+            # Same replace-not-merge rule, same authority: this fetch is what
+            # this airport saw that day, routes that have gone away included.
+            cur.execute(
+                "DELETE FROM flight_routes WHERE dest_icao = %s AND date = %s",
+                (icao, date_str),
+            )
+            for origin_icao, data in route_data.items():
+                cur.execute(
+                    """
+                    INSERT INTO flight_routes
+                        (origin_icao, dest_icao, date,
+                         flight_count, estimated_passengers)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (origin_icao, icao, date_str, data["flights"], data["pax"]),
                 )
 
             # Rotation state. An empty fetch is a strike; anything at all clears
