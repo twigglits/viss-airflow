@@ -1,0 +1,53 @@
+name: Sync dev data to production
+
+# The database this copies *from* is the dev one, on the workstation that runs the DAGs.
+# It is published on 127.0.0.1 and nowhere else, so a GitHub-hosted runner cannot see it
+# and no amount of secrets will change that. This job therefore only runs on a
+# self-hosted runner registered on that machine — that is the whole reason it is not a
+# `runs-on: ubuntu-latest` job like the deploys in the other repositories.
+#
+# Two things have to exist before the first run:
+#   * a self-hosted runner on the dev workstation, labelled `viss-dev`
+#   * repository secrets PROD_SSH_KEY / PROD_SSH_KNOWN_HOSTS, and a repository variable
+#     COMPOSE_DIR pointing at the viss-docker-compose checkout on that machine
+#
+# The production *deploy* key cannot be reused here: it is pinned server-side to a
+# forced command and can only run ~/deploy.sh. This needs a key that can run psql.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Write to production. Leave unticked to only report row counts.'
+        type: boolean
+        default: false
+
+# One sync at a time. Two overlapping runs would each drop and refill the same tables.
+concurrency:
+  group: prod-data-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: [self-hosted, viss-dev]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync
+        env:
+          KEY: ${{ secrets.PROD_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.PROD_SSH_KNOWN_HOSTS }}
+          COMPOSE_DIR: ${{ vars.COMPOSE_DIR }}
+        run: |
+          test -n "$KEY" || { echo "PROD_SSH_KEY is empty"; exit 1; }
+          test -n "$KNOWN_HOSTS" || { echo "PROD_SSH_KNOWN_HOSTS is empty"; exit 1; }
+          test -n "$COMPOSE_DIR" || { echo "COMPOSE_DIR variable is not set"; exit 1; }
+
+          # In RUNNER_TEMP, not ~/.ssh: a self-hosted runner shares a home directory with
+          # whoever else uses that machine, and this job has no business writing into it.
+          install -m 600 /dev/null "$RUNNER_TEMP/deploy"
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/deploy"
+          printf '%s\n' "$KNOWN_HOSTS" > "$RUNNER_TEMP/known_hosts"
+
+          export SSH="ssh -i $RUNNER_TEMP/deploy -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+          scripts/sync-data-to-prod.sh ${{ inputs.apply && '--yes' || '' }}

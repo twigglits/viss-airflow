@@ -130,6 +130,36 @@ sudo chown -R 50000:0 viss-airflow/logs
 sudo chmod -R u+rwX,g+rwX viss-airflow/logs
 ```
 
+## Syncing dev data to production
+
+Production runs no Airflow — the DAG services sit behind the compose `dag` profile and
+the prod deploy only brings up `--profile prod` — so nothing there ever writes the
+ingest tables. Dev ingests, prod serves, and `scripts/sync-data-to-prod.sh` is the
+bridge.
+
+```bash
+scripts/sync-data-to-prod.sh          # report row counts on both sides, write nothing
+scripts/sync-data-to-prod.sh --yes    # replace the production copies
+```
+
+It copies the reference and ingest tables (airports, aircraft, flight volumes, routes,
+age pyramids, ASFR, WHO GHO, World Bank) and nothing else: not `flight_states`, which
+is six hours of live sky rewritten continuously; not the `seirs_*` run outputs, which
+prod produces itself; not the rasters, which are large objects (see
+`VOLUME-MIGRATION.md`). Each table is dropped and refilled inside one transaction, so
+readers on the far side see either the old copy or the new one, never an empty table.
+
+Unlike the full dump-and-restore below, this does not drop the production database, and
+it does not need the box taken out of service.
+
+The SSH key used for the production *deploy* is pinned to a forced command and cannot
+run `psql`; this needs a key that can run commands, or your own access.
+
+The same script is wired to a `workflow_dispatch` job in
+`.github/workflows/sync-data-to-prod.yml`. That job needs a **self-hosted runner** on
+the dev workstation, labelled `viss-dev`: the dev database is published on 127.0.0.1
+and a GitHub-hosted runner cannot reach it.
+
 ## Pre-reqs for Geotiff ETL Pipeline(before each and every run)
 
 It is required to install the following apt packages inside of the airflow scheduler container for the processing of geotiff files to work in the DAG.
