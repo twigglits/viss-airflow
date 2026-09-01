@@ -45,7 +45,9 @@ import sys
 from fnmatch import fnmatch
 from pathlib import Path
 
+import numpy as np
 import rasterio
+from rasterio.windows import Window
 
 # ALL_CPUS is right when this script is the only thing running. It is wrong once
 # several country DAGs recompress at once -- each gdal_translate would claim all
@@ -89,14 +91,25 @@ def profile(path):
     return (not done), (COG_OPTS if is_cog else GTIFF_OPTS)
 
 
+# Row strips, NOT the file's own block_windows. The warp intermediates are striped
+# (1 x width) and the ZSTD rewrite is tiled 512x512, so hashing each file in its own
+# block order compares identical pixels in different byte groupings and every rewrite
+# reads as CORRUPT. A window shape that does not depend on the file's layout is the
+# only thing being compared here that has to stay fixed.
+HASH_BUDGET_BYTES = 32 << 20
+
+
 def _hash_dataset(src, h):
     for bidx in range(1, src.count + 1):
-        for _, window in src.block_windows(bidx):
+        itemsize = np.dtype(src.dtypes[bidx - 1]).itemsize
+        rows = max(1, HASH_BUDGET_BYTES // (src.width * itemsize))
+        for row in range(0, src.height, rows):
+            window = Window(0, row, src.width, min(rows, src.height - row))
             h.update(src.read(bidx, window=window, masked=False).tobytes())
 
 
 def raster_digest(path):
-    """SHA-256 over every decoded block, plus the georeferencing that must survive.
+    """SHA-256 over every pixel, plus the georeferencing that must survive.
 
     Overviews are hashed too, not just full resolution: they are what titiler
     serves at low zoom, so "lossless" has to mean the rendered map is unchanged
