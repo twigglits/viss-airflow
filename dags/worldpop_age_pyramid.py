@@ -10,14 +10,16 @@ import requests
 import rasterio
 
 from airflow import DAG
+from airflow.exceptions import AirflowSkipException
 from airflow.operators.python import PythonOperator, get_current_context
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 from recompress_zstd import recompress
 # Per-task ceiling. Without one, a wedged task holds an executor slot
 # forever -- and at core.parallelism=2 that is half the install.
-# per-country age-sex raster stack.
-TASK_TIMEOUT = timedelta(minutes=int(os.environ.get("AGEPYR_TASK_TIMEOUT_MIN", "120")))
+# A large country-year can take several hours to download and sum. Years run
+# serially below, so increasing this limit does not increase concurrent work.
+TASK_TIMEOUT = timedelta(minutes=int(os.environ.get("AGEPYR_TASK_TIMEOUT_MIN", "720")))
 
 
 # Output/storage root inside containers (mounted in docker-compose)
@@ -208,14 +210,41 @@ def _write_csv(iso3: str, year: int, bins: List[Tuple[str, float]]) -> str:
     return str(out_path)
 
 
-def build_age_pyramid_year(iso3: str, year: int):
-    _ensure_tools()
-    _ensure_db_tables_exist()
+def _stored_age_pyramid(iso3: str, year: int) -> List[Tuple[str, float]]:
+    """Return complete stored bins in age order, or an empty list for a gap."""
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT age_bin, pop FROM age_pyramid_5yr WHERE iso3 = %s AND year = %s",
+            (iso3, year),
+        )
+        stored = dict(cur.fetchall())
+    expected = [age_bin for age_bin, _ in _rebin_to_5yr({})]
+    if set(stored) != set(expected):
+        return []
+    return [(age_bin, float(stored[age_bin])) for age_bin in expected]
 
+
+def build_age_pyramid_year(iso3: str, year: int):
     ctx = get_current_context()
-    write_csv = (
-        ctx.get("dag_run").conf.get("write_csv", WRITE_CSV_DEFAULT) if ctx.get("dag_run") else WRITE_CSV_DEFAULT
-    )
+    conf = (ctx["dag_run"].conf or {}) if ctx.get("dag_run") else {}
+    selected_years = conf.get("years")
+    if selected_years is not None:
+        if not isinstance(selected_years, list) or any(type(y) is not int for y in selected_years):
+            raise ValueError("dag_run.conf.years must be a list of integer years")
+        if year not in selected_years:
+            raise AirflowSkipException(f"Year {year} was not selected for this run")
+
+    _ensure_db_tables_exist()
+    write_csv = conf.get("write_csv", WRITE_CSV_DEFAULT)
+    if not conf.get("force", False):
+        stored = _stored_age_pyramid(iso3, year)
+        if stored:
+            if write_csv:
+                return _write_csv(iso3, year, stored)
+            raise AirflowSkipException(f"Complete age pyramid already stored for {iso3} {year}")
+
+    _ensure_tools()
 
     age_codes = _age_codes_worldpop()
     iso3l = iso3.lower()
@@ -269,6 +298,7 @@ for CC3 in ISO3_CODES:
         schedule=None,
         catchup=False,
         max_active_runs=1,
+        max_active_tasks=1,
         default_args={"owner": "airflow", "retries": 1, "execution_timeout": TASK_TIMEOUT},
         tags=["worldpop", "age_pyramid", "demography", cc3u],
     ) as dag:
