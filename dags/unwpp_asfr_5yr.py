@@ -74,6 +74,7 @@ ASFR_DEBUG = os.environ.get("ASFR_DEBUG", "").strip().lower() in ("1", "true", "
 
 ASFR_VARIANT_CANDIDATES: dict[str, List[str]] = {
     # Store standardized variant_short_name keys on output; pick the first available underlying variant.
+    # MEDIAN is required by the model; uncertainty bounds are optional upstream.
     "LOWER95": ["LOWER95", "LOWER80", "LOW"],
     "MEDIAN": ["MEDIAN", "EST", "ESTIMATE", "MAIN"],
     "UPPER95": ["UPPER95", "UPPER80", "HIGH"],
@@ -271,7 +272,7 @@ def _fetch_asfr_rows(location_id: int, indicator_id: int, year: int) -> List[Tup
     if not dict_rows:
         return []
 
-    # Group by (sexId, variantShortName) so we can select specific uncertainty bounds.
+    # Group by (sexId, variantShortName) to select the median and any available bounds.
     groups: dict[tuple[int, str], list[dict]] = {}
     for r in dict_rows:
         sex_raw = _get_first_present(r, ("sexId", "SexID", "sex_id", "SexId"))
@@ -343,6 +344,9 @@ def _fetch_asfr_rows(location_id: int, indicator_id: int, year: int) -> List[Tup
                 found = cand
                 break
         if found is None:
+            if out_variant != "MEDIAN":
+                print(f"ASFR year={year}: optional {out_variant} unavailable; omitting bound")
+                continue
             available = sorted(list({v for (sid, v) in groups.keys() if sid == selected_sex_id}))
             print(
                 "WARNING: Missing required ASFR variant; skipping year="
@@ -367,6 +371,10 @@ def _fetch_asfr_rows(location_id: int, indicator_id: int, year: int) -> List[Tup
             if age_min < 15 or age_max > 49:
                 continue
             out.append((out_variant, age_min, age_max, val))
+
+    if not any(variant == "MEDIAN" for variant, _, _, _ in out):
+        print(f"WARNING: No usable ASFR median values for year={year}; skipping")
+        return []
 
     print(
         f"Selected ASFR variants for year={year} sexId={selected_sex_id}: "
