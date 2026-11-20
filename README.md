@@ -69,6 +69,26 @@ docker compose logs -f airflow-scheduler
 - Add your DAG files under `dags/`. Airflow will auto-detect changes within ~1 minute.
 - Use the Airflow Web UI to trigger runs manually, or set a `schedule_interval` in your DAG.
 
+### Controlled coverage backfill
+
+`backfill_remaining` runs the audited batch in
+`dags/backfill_remaining_plan.json`. Trigger the controller once. It advances three
+independent queues: one UN fertility country, one health/reference DAG, and one
+age-pyramid country at a time. Every launch waits for existing runs in its family
+to finish. Sensors and child-DAG waits release executor slots; the controller
+resumes through normal Airflow restarts. It has no automatic schedule.
+
+Age-pyramid DAGs now process one year at a time, allow up to 12 hours per year
+(`AGEPYR_TASK_TIMEOUT_MIN`), and skip complete stored age bins. A manual run can
+select years with `{"years": [2026]}`; `{"force": true}` still rebuilds stored years.
+CSV export can reuse complete stored bins without downloading rasters again.
+
+The plan records unavailable source files and unsupported UN location codes under
+`excluded`. A failed child is reported and the queue advances; the controller's
+final summary fails if any child needs follow-up. The individual child DAGs remain
+the place to inspect task logs and data results. Review or regenerate the plan
+against current coverage before starting a later maintenance batch.
+
 ## Installing Providers or Python Libraries
 
 - Add packages to `requirements.txt`. They will be installed into the Airflow containers on startup.
